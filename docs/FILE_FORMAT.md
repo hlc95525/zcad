@@ -2,104 +2,101 @@
 
 ## 版本
 
-当前版本：1
+当前版本：2
 
 ## 概述
 
-ZCAD使用基于SQLite的单文件格式（`.zcad`），这种设计带来以下优势：
+ZCAD 使用基于 **MessagePack + Zstd** 的紧凑二进制格式（`.zcad`），这种设计带来以下优势：
 
+- **体积小**：MessagePack 比 JSON 小 30-50%，Zstd 再压缩 60-80%
+- **速度快**：无需 SQL 解析，直接序列化/反序列化
 - **单文件**：易于分发和管理
-- **事务支持**：操作原子性，不会产生损坏的文件
-- **增量保存**：只写入变化的数据
-- **查询能力**：可以使用标准SQL工具查看和编辑
-- **跨平台**：SQLite在所有平台上都有良好支持
+- **简单可靠**：无外部数据库依赖
+- **跨平台**：Rust 原生实现，所有平台表现一致
 
-## 数据库架构
+## 文件结构
 
-### metadata 表
-
-存储文档级别的元数据。
-
-```sql
-CREATE TABLE metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+```
+┌─────────────────────────────────────┐
+│           文件头 (16 bytes)          │
+├─────────────────────────────────────┤
+│ Magic: "ZCAD" (4 bytes)             │
+│ Version: u32 LE (4 bytes)           │
+│ Flags: u32 LE (4 bytes, 预留)        │
+│ Compressed Size: u32 LE (4 bytes)   │
+├─────────────────────────────────────┤
+│     Zstd 压缩的 MessagePack 数据     │
+│ ┌─────────────────────────────────┐ │
+│ │ metadata: DocumentMetadata      │ │
+│ │ layers: Vec<Layer>              │ │
+│ │ entities: Vec<Entity>           │ │
+│ │ views: Vec<SavedView>           │ │
+│ └─────────────────────────────────┘ │
+└─────────────────────────────────────┘
 ```
 
-预定义的key：
+### 文件头
 
-| Key | 类型 | 描述 |
-|-----|------|------|
-| format_version | Integer | 文件格式版本号 |
-| document | JSON | 文档元数据 |
+| 偏移 | 大小 | 类型 | 描述 |
+|------|------|------|------|
+| 0 | 4 | bytes | 魔数 "ZCAD" |
+| 4 | 4 | u32 LE | 格式版本号 |
+| 8 | 4 | u32 LE | 标志位（预留） |
+| 12 | 4 | u32 LE | 压缩后数据长度 |
 
-document JSON结构：
+### 压缩参数
 
-```json
-{
-    "id": "uuid-v4",
-    "title": "Document Title",
-    "author": "Author Name",
-    "created_at": "2024-01-01T00:00:00Z",
-    "modified_at": "2024-01-01T00:00:00Z",
-    "format_version": 1,
-    "units": "mm",
-    "custom_properties": {}
+- 压缩算法：Zstd
+- 压缩级别：3（平衡速度和压缩比）
+
+## 数据结构
+
+### DocumentMetadata
+
+```rust
+struct DocumentMetadata {
+    id: Uuid,                              // 文档唯一标识
+    title: String,                         // 文档标题
+    author: String,                        // 作者
+    created_at: DateTime<Utc>,             // 创建时间
+    modified_at: DateTime<Utc>,            // 最后修改时间
+    format_version: u32,                   // 文件格式版本
+    units: String,                         // 单位 (mm, cm, m, inch, feet)
+    custom_properties: HashMap<String, String>,  // 自定义属性
 }
 ```
 
-### layers 表
+### Layer
 
-存储图层定义。
-
-```sql
-CREATE TABLE layers (
-    id INTEGER PRIMARY KEY,
-    generation INTEGER NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    data TEXT NOT NULL  -- JSON
-);
-```
-
-data JSON结构：
-
-```json
-{
-    "id": {"id": 1, "generation": 0},
-    "name": "Layer1",
-    "color": {"r": 255, "g": 255, "b": 255, "a": 255},
-    "line_type": "Continuous",
-    "line_weight": "Default",
-    "visible": true,
-    "locked": false,
-    "frozen": false,
-    "plottable": true,
-    "description": ""
+```rust
+struct Layer {
+    id: EntityId,                          // 图层ID
+    name: String,                          // 图层名称
+    color: Color,                          // 颜色
+    line_type: LineType,                   // 线型
+    line_weight: LineWeight,               // 线宽
+    visible: bool,                         // 可见性
+    locked: bool,                          // 锁定状态
+    frozen: bool,                          // 冻结状态
+    plottable: bool,                       // 可打印
+    description: String,                   // 描述
 }
 ```
 
-### entities 表
+### Entity
 
-存储所有几何实体。
-
-```sql
-CREATE TABLE entities (
-    id INTEGER PRIMARY KEY,
-    generation INTEGER NOT NULL,
-    layer_id INTEGER NOT NULL,
-    geometry_type TEXT NOT NULL,
-    geometry_data BLOB NOT NULL,  -- JSON (可选压缩)
-    properties_data TEXT NOT NULL,  -- JSON
-    visible INTEGER NOT NULL DEFAULT 1,
-    locked INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE INDEX idx_entities_layer ON entities(layer_id);
-CREATE INDEX idx_entities_type ON entities(geometry_type);
+```rust
+struct Entity {
+    id: EntityId,                          // 实体ID
+    geometry: Geometry,                    // 几何数据
+    properties: Properties,                // 属性
+    layer_id: EntityId,                    // 所属图层
+    visible: bool,                         // 可见性
+    locked: bool,                          // 锁定状态
+}
 ```
 
-#### geometry_type 值
+### Geometry 类型
 
 | 类型 | 描述 |
 |------|------|
@@ -113,141 +110,47 @@ CREATE INDEX idx_entities_type ON entities(geometry_type);
 | Text | 文字 |
 | Hatch | 填充 |
 
-#### geometry_data 结构
+### SavedView
 
-**Point:**
-```json
-{
-    "Point": {
-        "position": {"x": 0.0, "y": 0.0}
-    }
+```rust
+struct SavedView {
+    name: String,                          // 视图名称
+    center_x: f64,                         // 中心X坐标
+    center_y: f64,                         // 中心Y坐标
+    zoom: f64,                             // 缩放级别
 }
-```
-
-**Line:**
-```json
-{
-    "Line": {
-        "start": {"x": 0.0, "y": 0.0},
-        "end": {"x": 100.0, "y": 100.0}
-    }
-}
-```
-
-**Circle:**
-```json
-{
-    "Circle": {
-        "center": {"x": 50.0, "y": 50.0},
-        "radius": 25.0
-    }
-}
-```
-
-**Arc:**
-```json
-{
-    "Arc": {
-        "center": {"x": 50.0, "y": 50.0},
-        "radius": 25.0,
-        "start_angle": 0.0,
-        "end_angle": 1.5707963267948966
-    }
-}
-```
-
-**Polyline:**
-```json
-{
-    "Polyline": {
-        "vertices": [
-            {"point": {"x": 0.0, "y": 0.0}, "bulge": 0.0},
-            {"point": {"x": 100.0, "y": 0.0}, "bulge": 0.5},
-            {"point": {"x": 100.0, "y": 100.0}, "bulge": 0.0}
-        ],
-        "closed": true
-    }
-}
-```
-
-#### properties_data 结构
-
-```json
-{
-    "color": {"r": 255, "g": 0, "b": 0, "a": 255},
-    "line_type": "Continuous",
-    "line_weight": "Default",
-    "transparency": 0
-}
-```
-
-颜色特殊值：
-- `{"r": 0, "g": 0, "b": 0, "a": 0}` - ByLayer
-- `{"r": 0, "g": 0, "b": 0, "a": 1}` - ByBlock
-
-### views 表
-
-存储保存的视图。
-
-```sql
-CREATE TABLE views (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    center_x REAL NOT NULL,
-    center_y REAL NOT NULL,
-    zoom REAL NOT NULL
-);
 ```
 
 ## 文件操作
 
-### 创建新文件
-
-1. 创建SQLite数据库
-2. 执行架构创建语句
-3. 插入默认元数据
-4. 插入默认图层（图层0）
-
 ### 保存文件
 
-1. 开始事务
-2. 更新元数据
-3. 同步图层（删除、更新、插入）
-4. 同步实体（删除、更新、插入）
-5. 同步视图
-6. 提交事务
-7. 执行VACUUM优化（可选）
+1. 收集文档数据到 `FileContent` 结构
+2. 使用 MessagePack 序列化
+3. 使用 Zstd 压缩
+4. 写入文件头
+5. 写入压缩数据
 
 ### 加载文件
 
-1. 验证格式版本
-2. 读取元数据
-3. 读取所有图层
-4. 读取所有实体
-5. 读取所有视图
-6. 重建空间索引
-
-## 压缩
-
-对于大型几何数据（如包含大量顶点的多段线），可以使用zlib压缩：
-
-```
-geometry_data = zlib.compress(json.dumps(geometry))
-```
-
-压缩标志存储在geometry_type中：
-- `Polyline` - 未压缩
-- `Polyline:z` - zlib压缩
+1. 读取并验证文件头魔数
+2. 检查版本兼容性
+3. 读取压缩数据
+4. 使用 Zstd 解压缩
+5. 使用 MessagePack 反序列化
+6. 重建图层管理器
+7. 加载实体
+8. 重建空间索引
 
 ## 版本兼容性
 
 - 低版本软件无法打开高版本文件
 - 高版本软件可以打开低版本文件（向后兼容）
-- 版本升级时自动迁移数据
+- 版本升级时可能需要数据迁移
 
-## 与DXF的互操作
+## 与 DXF 的互操作
 
-ZCAD支持导入和导出DXF格式。
+ZCAD 支持导入和导出 DXF 格式。
 
 ### 导入映射
 
@@ -262,11 +165,11 @@ ZCAD支持导入和导出DXF格式。
 
 ### 导出映射
 
-所有ZCAD几何都可以导出为对应的DXF实体。
+所有 ZCAD 几何都可以导出为对应的 DXF 实体。
 
 ### 颜色映射
 
-使用AutoCAD颜色索引(ACI)与RGB之间的标准映射。
+使用 AutoCAD 颜色索引(ACI)与 RGB 之间的标准映射。
 
 | ACI | 颜色 | RGB |
 |-----|------|-----|
@@ -279,4 +182,3 @@ ZCAD支持导入和导出DXF格式。
 | 7 | White | #FFFFFF |
 | 256 | ByLayer | - |
 | 0 | ByBlock | - |
-

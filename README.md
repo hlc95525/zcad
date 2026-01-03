@@ -1,4 +1,4 @@
-# ZCAD - 下一代开源CAD系统
+# ZCAD - 下一代开源 CAD 系统
 
 <div align="center">
 
@@ -13,46 +13,50 @@
 
 ## 🎯 愿景
 
-ZCAD 致力于成为传统CAD软件的现代替代品，解决以下痛点：
+ZCAD 致力于成为传统 CAD 软件的现代替代品，解决以下痛点：
 
-- **性能问题**：传统CAD在大图形下卡顿严重，即使是高端硬件也无法流畅操作
+- **性能问题**：传统 CAD 在大图形下卡顿严重，即使是高端硬件也无法流畅操作
 - **封闭生态**：专有格式、昂贵授权、功能受限
-- **糟糕的对象处理**：如xclip爆炸产生大量无用对象
+- **糟糕的对象处理**：如 xclip 爆炸产生大量无用对象
 
 ## ✨ 核心特性
 
 ### 🚀 极致性能
-- **GPU加速渲染**：基于WebGPU/wgpu，充分利用现代GPU
-- **多线程架构**：几何计算、渲染、UI完全并行
-- **智能LOD**：远距离自动简化，保持流畅
+
+- **GPU 加速渲染**：基于 WebGPU/wgpu，充分利用现代 GPU
+- **多线程架构**：几何计算、渲染、UI 完全并行
+- **智能 LOD**：远距离自动简化，保持流畅
 - **增量更新**：只重绘变化的部分
 
 ### 📐 精确的几何内核
-- 自研2D/3D几何引擎
+
+- 自研 2D/3D 几何引擎
 - 精确的布尔运算
 - 智能的对象爆炸和分解
 - 约束求解器
 
 ### 📁 开放的文件格式
-- `.zcad` 原生格式（基于SQLite）
-- 完整的DXF读写支持
+
+- `.zcad` 原生格式（基于 SQLite）
+- 完整的 DXF 读写支持
 - 可扩展的插件系统
 
-### 🎨 现代UI
+### 🎨 现代 UI
+
 - 深色主题，护眼设计
 - 自定义工具栏和快捷键
-- 命令行界面（类AutoCAD）
+- 命令行界面（类 AutoCAD）
 - 多视口支持
 
 ## 🛠️ 技术栈
 
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| 语言 | Rust | 安全、高性能 |
-| 渲染 | wgpu | 跨平台GPU加速 |
-| UI | egui | 即时模式GUI |
-| 几何 | nalgebra + parry | 向量/矩阵 + 碰撞检测 |
-| 存储 | SQLite + FlatBuffers | 高效的数据持久化 |
+| 组件 | 技术                 | 说明                 |
+| ---- | -------------------- | -------------------- |
+| 语言 | Rust                 | 安全、高性能         |
+| 渲染 | wgpu                 | 跨平台 GPU 加速      |
+| UI   | egui                 | 即时模式 GUI         |
+| 几何 | nalgebra + parry     | 向量/矩阵 + 碰撞检测 |
+| 存储 | SQLite + FlatBuffers | 高效的数据持久化     |
 
 ## 📦 项目结构
 
@@ -80,11 +84,13 @@ zcad/
 - **Linux**: `zcad-linux-x64.tar.gz`
 
 #### Windows
+
 1. 解压 zip 文件
 2. 双击 `zcad.exe` 运行
 3. **系统要求**: Windows 10 (1809+) 或 Windows 11，支持 DirectX 12
 
 #### macOS
+
 ```bash
 # 解压
 tar -xzf zcad-macos-*.tar.gz
@@ -95,6 +101,7 @@ cd zcad
 ```
 
 #### Linux
+
 ```bash
 # 解压
 tar -xzf zcad-linux-x64.tar.gz
@@ -112,7 +119,7 @@ sudo apt install libxcb-render0 libxcb-shape0 libxcb-xfixes0 libxkbcommon0
 #### 前置要求
 
 - Rust 1.83+
-- 支持Vulkan/Metal/DX12的GPU
+- 支持 Vulkan/Metal/DX12 的 GPU
 
 #### 构建步骤
 
@@ -142,18 +149,21 @@ cargo build --release
 ### ⌨️ 快捷键
 
 #### 文件操作
+
 - `Ctrl+N` - 新建文档
 - `Ctrl+O` - 打开文件 (.zcad / .dxf)
 - `Ctrl+S` - 保存
 - `Ctrl+Shift+S` - 另存为
 
 #### 绘图工具
+
 - `L` - 直线
 - `C` - 圆
 - `R` - 矩形
 - `Space` - 选择工具
 
 #### 视图操作
+
 - `Z` - 缩放至全部
 - `G` - 切换网格显示
 - `F8` - 切换正交模式
@@ -161,30 +171,35 @@ cargo build --release
 - `鼠标中键拖动` - 平移视图
 
 #### 编辑操作
+
 - `Del` - 删除选中对象
 - `Esc` - 取消当前操作
 
 ## 🗺️ 路线图
 
 ### Phase 1: 基础框架 (当前)
+
 - [ ] 核心几何库（点、线、圆、弧、多段线）
-- [ ] GPU渲染管线
-- [ ] 基础UI框架
+- [ ] GPU 渲染管线
+- [ ] 基础 UI 框架
 - [ ] 文件格式规范
 
 ### Phase 2: 基础功能
-- [ ] 绘图命令（LINE, CIRCLE, ARC, PLINE等）
-- [ ] 编辑命令（MOVE, COPY, ROTATE, SCALE等）
+
+- [ ] 绘图命令（LINE, CIRCLE, ARC, PLINE 等）
+- [ ] 编辑命令（MOVE, COPY, ROTATE, SCALE 等）
 - [ ] 图层管理
 - [ ] 捕捉和追踪
 
 ### Phase 3: 高级功能
+
 - [ ] 块和外部参照
 - [ ] 标注系统
 - [ ] 打印/导出
-- [ ] DXF互操作
+- [ ] DXF 互操作
 
 ### Phase 4: 生态建设
+
 - [ ] 插件系统
 - [ ] 脚本支持（Lua/Python）
 - [ ] 在线协作
@@ -196,4 +211,3 @@ cargo build --release
 ## 🤝 贡献
 
 欢迎贡献！请参阅 [CONTRIBUTING.md](CONTRIBUTING.md) 了解详情。
-

@@ -7,8 +7,11 @@ pub enum FileError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("MessagePack encode error: {0}")]
+    MsgPackEncode(#[from] rmp_serde::encode::Error),
+
+    #[error("MessagePack decode error: {0}")]
+    MsgPackDecode(#[from] rmp_serde::decode::Error),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -28,4 +31,3 @@ pub enum FileError {
     #[error("Corruption detected: {0}")]
     Corruption(String),
 }
-

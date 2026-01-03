@@ -1,276 +1,195 @@
 //! ZCAD原生文件格式（.zcad）
 //!
-//! 基于SQLite的单文件格式，支持：
-//! - 增量保存
-//! - 压缩存储
-//! - 版本历史（可选）
+//! 基于 MessagePack + Zstd 的紧凑二进制格式：
+//! - 体积小：MessagePack 比 JSON 小 30-50%，Zstd 再压缩 60-80%
+//! - 速度快：无需 SQL 解析，直接序列化/反序列化
+//! - 简单可靠：无外部数据库依赖
 
 use crate::document::{Document, DocumentMetadata, SavedView};
 use crate::error::FileError;
-use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use zcad_core::entity::{Entity, EntityId};
-use zcad_core::geometry::Geometry;
+use zcad_core::entity::Entity;
 use zcad_core::layer::Layer;
-use zcad_core::properties::Properties;
+
+/// 文件魔数 "ZCAD"
+const MAGIC: &[u8; 4] = b"ZCAD";
 
 /// 当前文件格式版本
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// 创建数据库架构
-fn create_schema(conn: &Connection) -> Result<(), FileError> {
-    conn.execute_batch(
-        r#"
-        -- 元数据表
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
+/// Zstd 压缩级别（1-22，3 是默认值，平衡速度和压缩比）
+const COMPRESSION_LEVEL: i32 = 3;
 
-        -- 图层表
-        CREATE TABLE IF NOT EXISTS layers (
-            id INTEGER PRIMARY KEY,
-            generation INTEGER NOT NULL,
-            name TEXT NOT NULL UNIQUE,
-            data TEXT NOT NULL
-        );
+/// 文件头（16 字节）
+#[derive(Debug)]
+struct FileHeader {
+    /// 魔数 "ZCAD"
+    magic: [u8; 4],
+    /// 格式版本
+    version: u32,
+    /// 标志位（预留）
+    flags: u32,
+    /// 压缩后数据长度
+    compressed_size: u32,
+}
 
-        -- 实体表
-        CREATE TABLE IF NOT EXISTS entities (
-            id INTEGER PRIMARY KEY,
-            generation INTEGER NOT NULL,
-            layer_id INTEGER NOT NULL,
-            geometry_type TEXT NOT NULL,
-            geometry_data BLOB NOT NULL,
-            properties_data TEXT NOT NULL,
-            visible INTEGER NOT NULL DEFAULT 1,
-            locked INTEGER NOT NULL DEFAULT 0
-        );
+impl FileHeader {
+    fn new(compressed_size: u32) -> Self {
+        Self {
+            magic: *MAGIC,
+            version: FORMAT_VERSION,
+            flags: 0,
+            compressed_size,
+        }
+    }
 
-        -- 视图表
-        CREATE TABLE IF NOT EXISTS views (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            center_x REAL NOT NULL,
-            center_y REAL NOT NULL,
-            zoom REAL NOT NULL
-        );
+    fn write(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+        writer.write_all(&self.magic)?;
+        writer.write_all(&self.version.to_le_bytes())?;
+        writer.write_all(&self.flags.to_le_bytes())?;
+        writer.write_all(&self.compressed_size.to_le_bytes())?;
+        Ok(())
+    }
 
-        -- 创建索引
-        CREATE INDEX IF NOT EXISTS idx_entities_layer ON entities(layer_id);
-        CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(geometry_type);
-        "#,
-    )?;
+    fn read(reader: &mut impl Read) -> Result<Self, FileError> {
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic)?;
 
-    Ok(())
+        if &magic != MAGIC {
+            return Err(FileError::InvalidFormat(
+                "Invalid magic number, not a ZCAD file".to_string(),
+            ));
+        }
+
+        let mut buf = [0u8; 4];
+
+        reader.read_exact(&mut buf)?;
+        let version = u32::from_le_bytes(buf);
+
+        reader.read_exact(&mut buf)?;
+        let flags = u32::from_le_bytes(buf);
+
+        reader.read_exact(&mut buf)?;
+        let compressed_size = u32::from_le_bytes(buf);
+
+        Ok(Self {
+            magic,
+            version,
+            flags,
+            compressed_size,
+        })
+    }
+}
+
+/// 可序列化的文件内容
+#[derive(Debug, Serialize, Deserialize)]
+struct FileContent {
+    /// 文档元数据
+    metadata: DocumentMetadata,
+    /// 所有图层
+    layers: Vec<Layer>,
+    /// 所有实体
+    entities: Vec<Entity>,
+    /// 保存的视图
+    views: Vec<SavedView>,
 }
 
 /// 保存文档到文件
 pub fn save(document: &Document, path: &Path) -> Result<(), FileError> {
-    let conn = Connection::open(path)?;
+    // 收集文件内容
+    let content = FileContent {
+        metadata: document.metadata.clone(),
+        layers: document.layers.all_layers().iter().cloned().collect(),
+        entities: document.all_entities().cloned().collect(),
+        views: document.views.clone(),
+    };
 
-    // 创建架构
-    create_schema(&conn)?;
+    // 序列化为 MessagePack
+    let msgpack_data = rmp_serde::to_vec(&content)?;
 
-    // 开始事务
-    conn.execute("BEGIN TRANSACTION", [])?;
+    // 使用 Zstd 压缩
+    let compressed_data = zstd::encode_all(msgpack_data.as_slice(), COMPRESSION_LEVEL)?;
 
-    // 保存元数据
-    save_metadata(&conn, &document.metadata)?;
+    // 写入文件
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
 
-    // 清空并保存图层
-    conn.execute("DELETE FROM layers", [])?;
-    for layer in document.layers.all_layers() {
-        save_layer(&conn, layer)?;
-    }
+    // 写入文件头
+    let header = FileHeader::new(compressed_data.len() as u32);
+    header.write(&mut writer)?;
 
-    // 清空并保存实体
-    conn.execute("DELETE FROM entities", [])?;
-    for entity in document.all_entities() {
-        save_entity(&conn, entity)?;
-    }
+    // 写入压缩数据
+    writer.write_all(&compressed_data)?;
+    writer.flush()?;
 
-    // 清空并保存视图
-    conn.execute("DELETE FROM views", [])?;
-    for view in &document.views {
-        save_view(&conn, view)?;
-    }
+    tracing::info!(
+        "Saved {} entities, {} layers to {} ({} bytes compressed)",
+        content.entities.len(),
+        content.layers.len(),
+        path.display(),
+        compressed_data.len()
+    );
 
-    // 提交事务
-    conn.execute("COMMIT", [])?;
-
-    // 优化数据库
-    conn.execute("VACUUM", [])?;
-
-    Ok(())
-}
-
-fn save_metadata(conn: &Connection, metadata: &DocumentMetadata) -> Result<(), FileError> {
-    let json = serde_json::to_string(metadata)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('document', ?)",
-        params![json],
-    )?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('format_version', ?)",
-        params![FORMAT_VERSION.to_string()],
-    )?;
-    Ok(())
-}
-
-fn save_layer(conn: &Connection, layer: &Layer) -> Result<(), FileError> {
-    let data = serde_json::to_string(layer)?;
-    conn.execute(
-        "INSERT INTO layers (id, generation, name, data) VALUES (?, ?, ?, ?)",
-        params![layer.id.id as i64, layer.id.generation, &layer.name, &data],
-    )?;
-    Ok(())
-}
-
-fn save_entity(conn: &Connection, entity: &Entity) -> Result<(), FileError> {
-    let geometry_type = entity.geometry.type_name();
-    let geometry_data = serde_json::to_vec(&entity.geometry)?;
-    let properties_data = serde_json::to_string(&entity.properties)?;
-
-    conn.execute(
-        "INSERT INTO entities (id, generation, layer_id, geometry_type, geometry_data, properties_data, visible, locked)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
-            entity.id.id as i64,
-            entity.id.generation,
-            entity.layer_id.id as i64,
-            geometry_type,
-            &geometry_data,
-            &properties_data,
-            entity.visible as i32,
-            entity.locked as i32,
-        ],
-    )?;
-
-    Ok(())
-}
-
-fn save_view(conn: &Connection, view: &SavedView) -> Result<(), FileError> {
-    conn.execute(
-        "INSERT INTO views (name, center_x, center_y, zoom) VALUES (?, ?, ?, ?)",
-        params![&view.name, view.center_x, view.center_y, view.zoom],
-    )?;
     Ok(())
 }
 
 /// 从文件加载文档
 pub fn load(path: &Path) -> Result<Document, FileError> {
-    let conn = Connection::open(path)?;
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
 
-    // 检查格式版本
-    let version: String = conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'format_version'",
-        [],
-        |row| row.get(0),
-    )?;
+    // 读取文件头
+    let header = FileHeader::read(&mut reader)?;
 
-    let version: u32 = version
-        .parse()
-        .map_err(|_| FileError::InvalidFormat("Invalid version".to_string()))?;
-
-    if version > FORMAT_VERSION {
+    // 版本检查
+    if header.version > FORMAT_VERSION {
         return Err(FileError::UnsupportedVersion(format!(
             "File version {} is newer than supported version {}",
-            version, FORMAT_VERSION
+            header.version, FORMAT_VERSION
         )));
     }
 
+    // 读取压缩数据
+    let mut compressed_data = vec![0u8; header.compressed_size as usize];
+    reader.read_exact(&mut compressed_data)?;
+
+    // 解压缩
+    let msgpack_data = zstd::decode_all(compressed_data.as_slice())?;
+
+    // 反序列化
+    let content: FileContent = rmp_serde::from_slice(&msgpack_data)?;
+
+    // 重建文档
     let mut document = Document::new();
-
-    // 加载元数据
-    let metadata_json: String = conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'document'",
-        [],
-        |row| row.get(0),
-    )?;
-    document.metadata = serde_json::from_str(&metadata_json)?;
-
-    // 加载图层
-    let mut stmt = conn.prepare("SELECT data FROM layers ORDER BY id")?;
-    let layers: Vec<Layer> = stmt
-        .query_map([], |row| {
-            let data: String = row.get(0)?;
-            Ok(data)
-        })?
-        .filter_map(|r| r.ok())
-        .filter_map(|data| serde_json::from_str(&data).ok())
-        .collect();
+    document.metadata = content.metadata;
 
     // 重建图层管理器
     document.layers = zcad_core::layer::LayerManager::new();
-    for layer in layers.into_iter().skip(1) {
+    for layer in content.layers.into_iter().skip(1) {
         // 跳过默认图层0
         document.layers.add_layer(layer);
     }
 
     // 加载实体
-    let mut stmt = conn.prepare(
-        "SELECT id, generation, layer_id, geometry_data, properties_data, visible, locked FROM entities",
-    )?;
-
-    let entities: Vec<Entity> = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let generation: u32 = row.get(1)?;
-            let layer_id: i64 = row.get(2)?;
-            let geometry_data: Vec<u8> = row.get(3)?;
-            let properties_data: String = row.get(4)?;
-            let visible: i32 = row.get(5)?;
-            let locked: i32 = row.get(6)?;
-
-            Ok((
-                id,
-                generation,
-                layer_id,
-                geometry_data,
-                properties_data,
-                visible,
-                locked,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .filter_map(
-            |(id, generation, layer_id, geometry_data, properties_data, visible, locked)| {
-                let geometry: Geometry = serde_json::from_slice(&geometry_data).ok()?;
-                let properties: Properties = serde_json::from_str(&properties_data).ok()?;
-
-                Some(Entity {
-                    id: EntityId::from_raw(id as u64, generation),
-                    geometry,
-                    properties,
-                    layer_id: EntityId::from_raw(layer_id as u64, 0),
-                    visible: visible != 0,
-                    locked: locked != 0,
-                })
-            },
-        )
-        .collect();
-
-    for entity in entities {
+    for entity in content.entities {
         document.entities_mut().insert(entity.id, entity);
     }
 
     // 加载视图
-    let mut stmt = conn.prepare("SELECT name, center_x, center_y, zoom FROM views")?;
-    document.views = stmt
-        .query_map([], |row| {
-            Ok(SavedView {
-                name: row.get(0)?,
-                center_x: row.get(1)?,
-                center_y: row.get(2)?,
-                zoom: row.get(3)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    document.views = content.views;
 
     // 重建空间索引
     document.rebuild_spatial_index();
+
+    tracing::info!(
+        "Loaded {} entities, {} layers from {}",
+        document.entity_count(),
+        document.layers.count(),
+        path.display()
+    );
 
     Ok(document)
 }
@@ -297,6 +216,13 @@ mod tests {
         // 保存
         save(&doc, &file_path).expect("Failed to save");
 
+        // 验证文件头
+        let file = File::open(&file_path).expect("Failed to open");
+        let mut reader = BufReader::new(file);
+        let header = FileHeader::read(&mut reader).expect("Failed to read header");
+        assert_eq!(&header.magic, MAGIC);
+        assert_eq!(header.version, FORMAT_VERSION);
+
         // 加载
         let loaded = load(&file_path).expect("Failed to load");
 
@@ -306,5 +232,22 @@ mod tests {
         // 清理
         std::fs::remove_file(&file_path).ok();
     }
-}
 
+    #[test]
+    fn test_invalid_magic() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join("test_invalid.zcad");
+
+        // 写入无效的魔数
+        let mut file = File::create(&file_path).expect("Failed to create");
+        file.write_all(b"XXXX").expect("Failed to write");
+        file.write_all(&[0u8; 12]).expect("Failed to write padding");
+
+        // 尝试加载应该失败
+        let result = load(&file_path);
+        assert!(result.is_err());
+
+        // 清理
+        std::fs::remove_file(&file_path).ok();
+    }
+}
