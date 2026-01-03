@@ -722,7 +722,7 @@ impl SnapEngine {
         }
 
         // 切线长度
-        let tangent_len = (d * d - circle.radius * circle.radius).sqrt();
+        let _tangent_len = (d * d - circle.radius * circle.radius).sqrt();
         
         // 从圆心到点的方向
         let dir = (point - circle.center) / d;

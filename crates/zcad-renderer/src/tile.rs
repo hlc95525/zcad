@@ -4,7 +4,6 @@
 
 use crate::vertex::LineVertex;
 use zcad_core::math::{BoundingBox2, Point2};
-use zcad_core::properties::Color;
 use std::collections::HashMap;
 
 /// 渲染块（Tile）
@@ -197,7 +196,7 @@ impl TileManager {
                 let tile_key = Self::tile_key(tile_x, tile_y);
 
                 // 尝试从现有Tile复用
-                if let Some(mut existing_tile) = self.visible_tiles.remove(&tile_key) {
+                if let Some(existing_tile) = self.visible_tiles.remove(&tile_key) {
                     // Tile仍然可见，复用它
                     cache_hits += 1;
                     new_visible_tiles.insert(tile_key, existing_tile);
@@ -315,7 +314,7 @@ impl TileManager {
 
         for (key, tile) in &self.visible_tiles {
             if tile.dirty && !processed.contains(key) {
-                let mut region = TileRegion {
+                let region = TileRegion {
                     min_x: tile.screen_x,
                     min_y: tile.screen_y,
                     max_x: tile.screen_x + tile.screen_width,

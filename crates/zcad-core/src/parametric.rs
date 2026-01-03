@@ -525,8 +525,8 @@ impl ConstraintSystem {
         solve_result
     }
 
-    /// 评估单个约束是否满足
-    fn evaluate_constraint(&self, constraint: &Constraint) -> bool {
+    /// 评估单个约束是否满足（预留给约束求解器）
+    fn _evaluate_constraint(&self, constraint: &Constraint) -> bool {
         match constraint.constraint_type {
             ConstraintType::Distance => {
                 // 简化的距离约束评估

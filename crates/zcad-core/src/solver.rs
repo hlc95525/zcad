@@ -353,7 +353,7 @@ impl NewtonSolver {
         let mut x = self.variables.iter().map(|v| v.value).collect::<Vec<f64>>();
         let mut converged = false;
 
-        for iteration in 0..self.params.max_iterations {
+        for _iteration in 0..self.params.max_iterations {
             // 计算残差向量
             let residuals = self.compute_residuals(&x);
             let residual_norm = residuals.iter().map(|r| r * r).sum::<f64>().sqrt();

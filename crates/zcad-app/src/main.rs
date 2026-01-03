@@ -369,12 +369,63 @@ impl ZcadApp {
         };
 
         // 查找捕捉点
-        let snap = self.ui_state.snap_state.engine_mut().find_snap_point(
+        let mut snap = self.ui_state.snap_state.engine_mut().find_snap_point(
             self.ui_state.mouse_world_pos,
             &entities,
             self.camera_zoom,
             reference_point,
         );
+
+        // 特殊处理：绘制多段线时，检查是否接近起点（用于闭合）
+        if let EditState::Drawing { tool: DrawingTool::Polyline, points } = &self.ui_state.edit_state {
+            if points.len() >= 2 {
+                let start_point = points[0];
+                let world_tolerance = self.ui_state.snap_state.config().tolerance / self.camera_zoom;
+                let dist_to_start = (self.ui_state.mouse_world_pos - start_point).norm();
+                
+                if dist_to_start <= world_tolerance {
+                    // 比当前捕捉点更近，或者没有当前捕捉点
+                    let should_use_start = match &snap {
+                        Some(existing) => dist_to_start < existing.distance,
+                        None => true,
+                    };
+                    
+                    if should_use_start {
+                        snap = Some(zcad_core::snap::SnapPoint::new(
+                            start_point,
+                            zcad_core::snap::SnapType::Endpoint,
+                            None,
+                            dist_to_start,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 同样处理圆弧：可以捕捉到第一个点
+        if let EditState::Drawing { tool: DrawingTool::Arc, points } = &self.ui_state.edit_state {
+            if !points.is_empty() {
+                let first_point = points[0];
+                let world_tolerance = self.ui_state.snap_state.config().tolerance / self.camera_zoom;
+                let dist_to_first = (self.ui_state.mouse_world_pos - first_point).norm();
+                
+                if dist_to_first <= world_tolerance {
+                    let should_use_first = match &snap {
+                        Some(existing) => dist_to_first < existing.distance,
+                        None => true,
+                    };
+                    
+                    if should_use_first {
+                        snap = Some(zcad_core::snap::SnapPoint::new(
+                            first_point,
+                            zcad_core::snap::SnapType::Endpoint,
+                            None,
+                            dist_to_first,
+                        ));
+                    }
+                }
+            }
+        }
 
         self.ui_state.snap_state.current_snap = snap;
     }
@@ -619,12 +670,30 @@ impl ZcadApp {
                         }
                     }
                     DrawingTool::Polyline => {
-                        // 多段线：持续添加点，右键结束
+                        // 检查是否点击了起点（闭合多段线）
+                        if new_points.len() >= 3 {
+                            let start = new_points[0];
+                            let current = new_points[new_points.len() - 1];
+                            let tolerance = 0.001; // 很小的容差，因为捕捉已经对齐了
+                            
+                            if (current - start).norm() < tolerance {
+                                // 点击了起点，创建闭合多段线
+                                new_points.pop(); // 移除重复的终点
+                                let polyline = Polyline::from_points(new_points, true); // closed = true
+                                let entity = Entity::new(Geometry::Polyline(polyline));
+                                self.document.add_entity(entity);
+                                self.ui_state.edit_state = EditState::Idle;
+                                self.ui_state.status_message = "闭合多段线已创建".to_string();
+                                return;
+                            }
+                        }
+                        
+                        // 否则继续添加点
                         self.ui_state.edit_state = EditState::Drawing {
                             tool: DrawingTool::Polyline,
                             points: new_points,
                         };
-                        self.ui_state.status_message = "多段线: 指定下一点 (右键结束):".to_string();
+                        self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合):".to_string();
                     }
                     _ => {}
                 }
@@ -833,20 +902,20 @@ impl eframe::App for ZcadApp {
                         self.document = Document::new();
                         self.ui_state.clear_selection();
                         self.ui_state.status_message = "新文档".to_string();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("📂 打开 (Ctrl+O)").clicked() {
                         self.show_open_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("💾 保存 (Ctrl+S)").clicked() {
                         self.quick_save();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("💾 另存为 (Ctrl+Shift+S)").clicked() {
                         self.show_save_dialog();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("🚪 退出").clicked() {
@@ -859,35 +928,35 @@ impl eframe::App for ZcadApp {
                             self.document.remove_entity(&id);
                         }
                         self.ui_state.clear_selection();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("视图", |ui| {
                     if ui.button("📐 缩放至全部 (Z)").clicked() {
                         self.zoom_to_fit();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(format!("{} 网格 (G)", if grid { "☑" } else { "☐" })).clicked() {
                         self.ui_state.show_grid = !self.ui_state.show_grid;
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(format!("{} 正交 (F8)", if ortho { "☑" } else { "☐" })).clicked() {
                         self.ui_state.ortho_mode = !self.ui_state.ortho_mode;
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 ui.menu_button("绘图", |ui| {
                     if ui.button("╱ 直线 (L)").clicked() {
                         self.ui_state.set_tool(DrawingTool::Line);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("○ 圆 (C)").clicked() {
                         self.ui_state.set_tool(DrawingTool::Circle);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("▭ 矩形 (R)").clicked() {
                         self.ui_state.set_tool(DrawingTool::Rectangle);
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });

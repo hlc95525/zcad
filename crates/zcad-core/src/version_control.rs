@@ -577,7 +577,7 @@ impl VersionControl {
 
     /// 加载分支信息
     fn load_branches(&mut self) -> Result<(), VCError> {
-        let output = self.git_command(&["branch", "-a"])?;
+        let _output = self.git_command(&["branch", "-a"])?;
         // 解析分支信息（简化实现）
         // 实际应该解析输出并创建Branch对象
         Ok(())

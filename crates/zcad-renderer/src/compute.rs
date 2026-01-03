@@ -6,11 +6,10 @@
 //! - 路径简化
 //! - 几何变换
 
-use crate::vertex::{CameraUniform, LineVertex};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
-use zcad_core::geometry::{Circle, Geometry, Line, Point, Polyline};
-use zcad_core::math::{BoundingBox2, Point2};
+use zcad_core::geometry::{Circle, Geometry, Line, Point};
+use zcad_core::math::Point2;
 
 /// 计算着色器错误
 #[derive(Error, Debug)]
@@ -38,9 +37,9 @@ pub struct ComputeShader {
     offset_pipeline: wgpu::ComputePipeline,
     offset_bind_group_layout: wgpu::BindGroupLayout,
 
-    // 几何变换管线
-    transform_pipeline: wgpu::ComputePipeline,
-    transform_bind_group_layout: wgpu::BindGroupLayout,
+    // 几何变换管线（预留）
+    _transform_pipeline: wgpu::ComputePipeline,
+    _transform_bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl ComputeShader {
@@ -206,8 +205,8 @@ impl ComputeShader {
             boolean_bind_group_layout,
             offset_pipeline,
             offset_bind_group_layout,
-            transform_pipeline,
-            transform_bind_group_layout,
+            _transform_pipeline: transform_pipeline,
+            _transform_bind_group_layout: transform_bind_group_layout,
         })
     }
 

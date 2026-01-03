@@ -77,7 +77,7 @@ pub struct PerformanceMetrics {
 
 /// 消息总线
 pub struct MessageBus {
-    sender: Arc<RwLock<mpsc::UnboundedSender<Message>>>,
+    _sender: Arc<RwLock<mpsc::UnboundedSender<Message>>>,
     receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<Message>>>>,
     subscribers: Arc<RwLock<HashMap<String, Vec<mpsc::UnboundedSender<Message>>>>>,
 }
@@ -88,7 +88,7 @@ impl MessageBus {
         let (sender, receiver) = mpsc::unbounded();
 
         Self {
-            sender: Arc::new(RwLock::new(sender)),
+            _sender: Arc::new(RwLock::new(sender)),
             receiver: Arc::new(RwLock::new(Some(receiver))),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -180,7 +180,7 @@ impl TaskProcessor {
 
         for task in tasks {
             let permit = self.semaphore.clone().acquire_owned().await.map_err(|e| e.to_string());
-            let message_bus = self.message_bus.clone();
+            let _message_bus = self.message_bus.clone();
 
             let handle = task::spawn(async move {
                 let _permit = permit?;
@@ -206,7 +206,7 @@ impl TaskProcessor {
 
 /// 数据流管道（简化版本）
 pub struct DataPipeline<T> {
-    message_bus: Arc<MessageBus>,
+    _message_bus: Arc<MessageBus>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -214,7 +214,7 @@ impl<T> DataPipeline<T> {
     /// 创建数据管道
     pub fn new(message_bus: Arc<MessageBus>) -> Self {
         Self {
-            message_bus,
+            _message_bus: message_bus,
             _phantom: std::marker::PhantomData,
         }
     }

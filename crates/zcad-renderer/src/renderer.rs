@@ -425,7 +425,7 @@ impl Renderer {
         });
 
         // Tile-based渲染：只渲染脏Tile
-        let dirty_regions = self.tile_manager.optimize_dirty_regions();
+        let _dirty_regions = self.tile_manager.optimize_dirty_regions();
 
         {
             let clear = clear_color.to_f32_array();

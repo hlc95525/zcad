@@ -9,11 +9,11 @@ use crate::entity::EntityId;
 use crate::math::{BoundingBox2, Point2};
 use std::collections::HashMap;
 
-/// 空间索引条目
+/// 空间索引条目（预留给R-tree实现）
 #[derive(Debug, Clone)]
-struct SpatialEntry {
-    id: EntityId,
-    bbox: BoundingBox2,
+struct _SpatialEntry {
+    _id: EntityId,
+    _bbox: BoundingBox2,
 }
 
 /// 简单的空间索引（基于网格）
