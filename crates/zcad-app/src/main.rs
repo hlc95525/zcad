@@ -17,6 +17,17 @@ use zcad_file::Document;
 use zcad_ui::command_line::show_command_line;
 use zcad_ui::state::{Command, DrawingTool, EditState, InputType, UiState};
 
+/// 可撤销的操作类型
+#[derive(Debug, Clone)]
+enum UndoableOperation {
+    /// 创建实体（记录创建的实体ID，用于撤销时删除）
+    CreateEntities(Vec<Entity>),
+    /// 删除实体（记录被删除的实体，用于撤销时恢复）
+    DeleteEntities(Vec<Entity>),
+    /// 修改实体（记录实体ID和修改前的状态）
+    ModifyEntities(Vec<(Entity, Entity)>), // (旧实体, 新实体)
+}
+
 /// ZCAD 应用程序
 struct ZcadApp {
     document: Document,
@@ -32,6 +43,10 @@ struct ZcadApp {
     
     // 剪贴板（存储复制的几何体）
     clipboard: Vec<Geometry>,
+    
+    // 撤销/重做历史
+    undo_stack: Vec<UndoableOperation>,
+    redo_stack: Vec<UndoableOperation>,
 }
 
 /// 文件操作类型
@@ -51,6 +66,8 @@ impl Default for ZcadApp {
             viewport_size: (800.0, 600.0),
             pending_file_op: None,
             clipboard: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         app.create_demo_content();
         app
@@ -2005,6 +2022,23 @@ impl ZcadApp {
         }
     }
 
+    /// 删除选中的实体（带撤销支持）
+    fn delete_selected_entities(&mut self) {
+        let mut deleted_entities = Vec::new();
+        for id in self.ui_state.selected_entities.clone() {
+            if let Some(entity) = self.document.remove_entity(&id) {
+                deleted_entities.push(entity);
+            }
+        }
+        if !deleted_entities.is_empty() {
+            let count = deleted_entities.len();
+            self.undo_stack.push(UndoableOperation::DeleteEntities(deleted_entities));
+            self.redo_stack.clear();
+            self.ui_state.status_message = format!("已删除 {} 个实体", count);
+        }
+        self.ui_state.clear_selection();
+    }
+
     /// 快速保存（已有路径）
     fn quick_save(&mut self) {
         if self.document.file_path().is_some() {
@@ -2031,10 +2065,7 @@ impl ZcadApp {
                 self.ui_state.set_tool(tool);
             }
             Command::DeleteSelected => {
-                for id in self.ui_state.selected_entities.clone() {
-                    self.document.remove_entity(&id);
-                }
-                self.ui_state.clear_selection();
+                self.delete_selected_entities();
             }
             Command::Move => {
                 if !self.ui_state.selected_entities.is_empty() {
@@ -2111,10 +2142,64 @@ impl ZcadApp {
                 self.show_export_dxf_dialog();
             }
             Command::Undo => {
-                // 撤销命令处理
+                if let Some(op) = self.undo_stack.pop() {
+                    match &op {
+                        UndoableOperation::CreateEntities(entities) => {
+                            // 撤销创建：删除这些实体
+                            for entity in entities {
+                                self.document.remove_entity(&entity.id);
+                            }
+                            self.ui_state.status_message = format!("撤销: 删除了 {} 个实体", entities.len());
+                        }
+                        UndoableOperation::DeleteEntities(entities) => {
+                            // 撤销删除：恢复这些实体
+                            for entity in entities {
+                                self.document.add_entity(entity.clone());
+                            }
+                            self.ui_state.status_message = format!("撤销: 恢复了 {} 个实体", entities.len());
+                        }
+                        UndoableOperation::ModifyEntities(changes) => {
+                            // 撤销修改：恢复到旧状态
+                            for (old_entity, _new_entity) in changes {
+                                self.document.update_entity(&old_entity.id, old_entity.clone());
+                            }
+                            self.ui_state.status_message = format!("撤销: 恢复了 {} 个实体的修改", changes.len());
+                        }
+                    }
+                    self.redo_stack.push(op);
+                } else {
+                    self.ui_state.status_message = "没有可撤销的操作".to_string();
+                }
             }
             Command::Redo => {
-                // 重做命令处理
+                if let Some(op) = self.redo_stack.pop() {
+                    match &op {
+                        UndoableOperation::CreateEntities(entities) => {
+                            // 重做创建：重新添加实体
+                            for entity in entities {
+                                self.document.add_entity(entity.clone());
+                            }
+                            self.ui_state.status_message = format!("重做: 创建了 {} 个实体", entities.len());
+                        }
+                        UndoableOperation::DeleteEntities(entities) => {
+                            // 重做删除：再次删除实体
+                            for entity in entities {
+                                self.document.remove_entity(&entity.id);
+                            }
+                            self.ui_state.status_message = format!("重做: 删除了 {} 个实体", entities.len());
+                        }
+                        UndoableOperation::ModifyEntities(changes) => {
+                            // 重做修改：应用新状态
+                            for (_old_entity, new_entity) in changes {
+                                self.document.update_entity(&new_entity.id, new_entity.clone());
+                            }
+                            self.ui_state.status_message = format!("重做: 修改了 {} 个实体", changes.len());
+                        }
+                    }
+                    self.undo_stack.push(op);
+                } else {
+                    self.ui_state.status_message = "没有可重做的操作".to_string();
+                }
             }
             Command::DataInput(input) => {
                 self.handle_data_input(&input);
@@ -2784,10 +2869,7 @@ impl eframe::App for ZcadApp {
                 });
                 ui.menu_button("编辑", |ui| {
                     if ui.button("🗑 删除 (Del)").clicked() {
-                        for id in self.ui_state.selected_entities.clone() {
-                            self.document.remove_entity(&id);
-                        }
-                        self.ui_state.clear_selection();
+                        self.delete_selected_entities();
                         ui.close();
                     }
                 });
@@ -2874,10 +2956,7 @@ impl eframe::App for ZcadApp {
                 }
                 ui.separator();
                 if ui.button("🗑").on_hover_text("删除选中").clicked() {
-                    for id in self.ui_state.selected_entities.clone() {
-                        self.document.remove_entity(&id);
-                    }
-                    self.ui_state.clear_selection();
+                    self.delete_selected_entities();
                 }
                 ui.separator();
                 if ui.selectable_label(ortho, "⊥").on_hover_text("正交模式 (F8)").clicked() {
@@ -3276,10 +3355,15 @@ impl eframe::App for ZcadApp {
                             self.ui_state.cancel();
                         }
                         if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
-                            for id in self.ui_state.selected_entities.clone() {
-                                self.document.remove_entity(&id);
-                            }
-                            self.ui_state.clear_selection();
+                            self.delete_selected_entities();
+                        }
+                        // 撤销 Ctrl+Z
+                        if i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
+                            self.handle_command(Command::Undo);
+                        }
+                        // 重做 Ctrl+Y 或 Ctrl+Shift+Z
+                        if i.modifiers.command && (i.key_pressed(egui::Key::Y) || (i.key_pressed(egui::Key::Z) && i.modifiers.shift)) {
+                            self.handle_command(Command::Redo);
                         }
                         // 复制 Ctrl+C
                         if i.modifiers.command && i.key_pressed(egui::Key::C) {

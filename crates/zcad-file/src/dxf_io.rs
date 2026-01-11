@@ -6,6 +6,7 @@
 //! - 视口（Viewport）
 
 use crate::document::Document;
+use crate::dxf_raw::{DxfRawParser, DxfWriter, parse_layouts, parse_viewports};
 use crate::error::FileError;
 use std::path::Path;
 use zcad_core::entity::Entity;
@@ -13,8 +14,7 @@ use zcad_core::geometry::{
     Arc, Circle, Ellipse, Geometry, Leader, Line, Polyline, PolylineVertex, 
     Spline, Text,
 };
-// 布局相关导入（用于简化的布局导入功能）
-// use zcad_core::layout::{Layout, Viewport, ViewportId};
+use zcad_core::layout::{Layout, PaperSize, PaperOrientation, Viewport, ViewportId, ViewportStatus};
 use zcad_core::math::{Point2, Vector2};
 use zcad_core::properties::{Color, Properties};
 
@@ -38,15 +38,218 @@ pub fn import(path: &Path) -> Result<Document, FileError> {
         }
     }
 
-    // 导入布局信息
-    // 注意：dxf crate 对 Layout/Viewport 的支持有限
-    // 我们创建一个默认视口来显示模型空间的范围
-    import_layouts_simplified(&drawing, &mut document);
+    // 使用原始解析器导入完整的布局和视口信息
+    if let Ok(mut raw_parser) = DxfRawParser::load(path) {
+        import_layouts_full(&mut raw_parser, &drawing, &mut document);
+    } else {
+        // 回退到简化模式
+        import_layouts_simplified(&drawing, &mut document);
+    }
 
     // 设置文件路径
     document.set_file_path(path);
 
     Ok(document)
+}
+
+/// 完整的布局导入（使用原始解析器）
+fn import_layouts_full(
+    raw_parser: &mut DxfRawParser,
+    drawing: &dxf::Drawing,
+    document: &mut Document,
+) {
+    // 1. 解析 LAYOUT 对象
+    let dxf_layouts = parse_layouts(raw_parser);
+    
+    // 2. 解析 VIEWPORT 实体
+    let dxf_viewports = parse_viewports(raw_parser);
+    
+    // 3. 计算模型空间边界（用于设置默认视图）
+    let model_bounds = calculate_model_bounds(drawing);
+    
+    // 4. 更新或创建布局
+    for dxf_layout in &dxf_layouts {
+        // 跳过模型空间
+        if dxf_layout.is_model_space {
+            continue;
+        }
+        
+        // 确定图纸尺寸
+        let paper_size = determine_paper_size(dxf_layout.paper_width, dxf_layout.paper_height);
+        let orientation = if dxf_layout.paper_width > dxf_layout.paper_height {
+            PaperOrientation::Landscape
+        } else {
+            PaperOrientation::Portrait
+        };
+        
+        // 查找属于此布局的视口
+        let layout_viewports: Vec<Viewport> = dxf_viewports
+            .iter()
+            .filter(|vp| vp.owner_handle == dxf_layout.block_record_handle || 
+                         vp.owner_handle.is_empty()) // 如果没有 owner，假设属于第一个布局
+            .enumerate()
+            .map(|(idx, dxf_vp)| {
+                convert_raw_viewport_to_zcad(dxf_vp, idx as u64 + 1, &model_bounds)
+            })
+            .collect();
+        
+        // 更新现有布局或添加新布局
+        if let Some(existing) = document.layout_manager.get_layout_by_name(&dxf_layout.name) {
+            let existing_id = existing.id;
+            if let Some(layout) = document.layout_manager.get_layout_mut(existing_id) {
+                layout.paper_size = paper_size;
+                layout.orientation = orientation;
+                layout.margins = (
+                    dxf_layout.top_margin,
+                    dxf_layout.right_margin,
+                    dxf_layout.bottom_margin,
+                    dxf_layout.left_margin,
+                );
+                if !layout_viewports.is_empty() {
+                    layout.viewports = layout_viewports;
+                }
+            }
+        } else {
+            // 添加新布局
+            let layout_id = document.layout_manager.add_layout(&dxf_layout.name);
+            if let Some(layout) = document.layout_manager.get_layout_mut(layout_id) {
+                layout.paper_size = paper_size;
+                layout.orientation = orientation;
+                layout.margins = (
+                    dxf_layout.top_margin,
+                    dxf_layout.right_margin,
+                    dxf_layout.bottom_margin,
+                    dxf_layout.left_margin,
+                );
+                if !layout_viewports.is_empty() {
+                    layout.viewports = layout_viewports;
+                }
+            }
+        }
+    }
+    
+    // 如果没有解析到任何布局，使用简化模式
+    if dxf_layouts.iter().filter(|l| !l.is_model_space).count() == 0 {
+        import_layouts_simplified(drawing, document);
+    }
+}
+
+/// 计算模型空间边界
+fn calculate_model_bounds(drawing: &dxf::Drawing) -> Option<(f64, f64, f64, f64)> {
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    let mut has_entities = false;
+    
+    for entity in drawing.entities() {
+        if let Some(bbox) = get_entity_bounds(entity) {
+            min_x = min_x.min(bbox.0);
+            min_y = min_y.min(bbox.1);
+            max_x = max_x.max(bbox.2);
+            max_y = max_y.max(bbox.3);
+            has_entities = true;
+        }
+    }
+    
+    if has_entities {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
+
+/// 根据尺寸确定标准图纸大小
+fn determine_paper_size(width: f64, height: f64) -> PaperSize {
+    let (w, h) = if width > height { (width, height) } else { (height, width) };
+    
+    // 检查常见纸张尺寸（允许 5mm 误差）
+    let tolerance = 5.0;
+    
+    if (w - 1189.0).abs() < tolerance && (h - 841.0).abs() < tolerance {
+        PaperSize::A0
+    } else if (w - 841.0).abs() < tolerance && (h - 594.0).abs() < tolerance {
+        PaperSize::A1
+    } else if (w - 594.0).abs() < tolerance && (h - 420.0).abs() < tolerance {
+        PaperSize::A2
+    } else if (w - 420.0).abs() < tolerance && (h - 297.0).abs() < tolerance {
+        PaperSize::A3
+    } else if (w - 297.0).abs() < tolerance && (h - 210.0).abs() < tolerance {
+        PaperSize::A4
+    } else {
+        PaperSize::Custom { width, height }
+    }
+}
+
+/// 将原始 DXF 视口转换为 ZCAD 视口
+fn convert_raw_viewport_to_zcad(
+    dxf_vp: &crate::dxf_raw::DxfViewport,
+    id: u64,
+    model_bounds: &Option<(f64, f64, f64, f64)>,
+) -> Viewport {
+    // 计算视口位置（从中心转换为左下角）
+    let position = Point2::new(
+        dxf_vp.center.x - dxf_vp.width / 2.0,
+        dxf_vp.center.y - dxf_vp.height / 2.0,
+    );
+    
+    let mut viewport = Viewport::new(ViewportId::new(id), position, dxf_vp.width, dxf_vp.height);
+    
+    // 设置视图中心
+    viewport.view_center = dxf_vp.view_center;
+    
+    // 计算比例
+    if dxf_vp.view_height > 0.0 && dxf_vp.height > 0.0 {
+        viewport.scale = dxf_vp.view_height / dxf_vp.height;
+    }
+    
+    // 设置状态
+    viewport.status = if dxf_vp.status > 0 {
+        ViewportStatus::Inactive
+    } else {
+        ViewportStatus::Hidden
+    };
+    
+    viewport
+}
+
+/// 创建默认视口
+fn create_default_viewport(layout: &Layout, model_bounds: &Option<(f64, f64, f64, f64)>) -> Viewport {
+    let (paper_w, paper_h) = layout.paper_size.dimensions_mm();
+    let margins = layout.margins;
+    
+    // 计算可用区域
+    let usable_width = paper_w - margins.1 - margins.3;
+    let usable_height = paper_h - margins.0 - margins.2;
+    
+    // 视口位置（留边距）
+    let position = Point2::new(margins.3, margins.2);
+    
+    let mut viewport = Viewport::new(
+        ViewportId::new(1),
+        position,
+        usable_width,
+        usable_height,
+    );
+    
+    // 如果有模型边界，设置视图
+    if let Some((min_x, min_y, max_x, max_y)) = model_bounds {
+        let model_width = max_x - min_x;
+        let model_height = max_y - min_y;
+        
+        viewport.view_center = Point2::new(
+            (min_x + max_x) / 2.0,
+            (min_y + max_y) / 2.0,
+        );
+        
+        // 计算适合的比例
+        let scale_x = model_width / usable_width;
+        let scale_y = model_height / usable_height;
+        viewport.scale = scale_x.max(scale_y) * 1.1; // 10% 边距
+    }
+    
+    viewport.status = ViewportStatus::Active;
+    viewport
 }
 
 /// 简化的布局导入
@@ -375,29 +578,382 @@ pub fn export(document: &Document, path: &Path) -> Result<(), FileError> {
     Ok(())
 }
 
-/// 导出图纸空间实体
-/// 
-/// 注意：dxf crate 对 VIEWPORT 实体的支持有限
-/// 这里只导出图纸空间的普通实体（如图框、标题栏等）
+/// 导出图纸空间实体和视口
 fn export_paper_space_entities(document: &Document, drawing: &mut dxf::Drawing) {
     // 遍历所有布局
     for layout in document.layout_manager.layouts() {
         // 导出图纸空间实体
         for entity in &layout.paper_space_entities {
             if let Some(dxf_entity) = convert_to_dxf_entity(entity) {
-                // 注意：完整的图纸空间支持需要将实体放入正确的块记录
-                // dxf crate 可能不完全支持此功能
-                // 当前实现将图纸空间实体也放入模型空间
                 drawing.add_entity(dxf_entity);
             }
         }
     }
+}
+
+/// 使用原始写入器导出完整的 DXF（包括布局和视口）
+/// 
+/// 此函数生成包含完整 Layout/Viewport 信息的 DXF 文件
+#[allow(dead_code)]
+pub fn export_full(document: &Document, path: &Path) -> Result<(), FileError> {
+    let mut writer = DxfWriter::new();
     
-    // 注意：完整的布局/视口导出需要：
-    // 1. 创建 BLOCK_RECORD 表项
-    // 2. 创建 LAYOUT 对象
-    // 3. 创建 VIEWPORT 实体
-    // dxf crate 可能不完全支持这些高级功能
+    // 1. 写入 HEADER 段
+    write_header_section(&mut writer);
+    
+    // 2. 写入 TABLES 段
+    write_tables_section(&mut writer, document);
+    
+    // 3. 写入 BLOCKS 段
+    write_blocks_section(&mut writer, document);
+    
+    // 4. 写入 ENTITIES 段
+    write_entities_section(&mut writer, document);
+    
+    // 5. 写入 OBJECTS 段
+    write_objects_section(&mut writer, document);
+    
+    // 保存文件
+    writer.save_to_file(path)
+}
+
+/// 写入 HEADER 段
+fn write_header_section(writer: &mut DxfWriter) {
+    writer.begin_section("HEADER");
+    
+    // AutoCAD 版本
+    writer.write_pair(9, "$ACADVER");
+    writer.write_pair(1, "AC1027"); // AutoCAD 2013 格式
+    
+    // 默认图层
+    writer.write_pair(9, "$CLAYER");
+    writer.write_pair(8, "0");
+    
+    writer.end_section();
+}
+
+/// 写入 TABLES 段
+fn write_tables_section(writer: &mut DxfWriter, document: &Document) {
+    writer.begin_section("TABLES");
+    
+    // VPORT 表
+    writer.write_pair(0, "TABLE");
+    writer.write_pair(2, "VPORT");
+    writer.write_handle_only();
+    writer.write_pair(70, 1);
+    writer.write_pair(0, "ENDTAB");
+    
+    // LTYPE 表
+    writer.write_pair(0, "TABLE");
+    writer.write_pair(2, "LTYPE");
+    writer.write_handle_only();
+    writer.write_pair(70, 1);
+    
+    // CONTINUOUS 线型
+    writer.write_pair(0, "LTYPE");
+    writer.write_handle_only();
+    writer.write_pair(2, "CONTINUOUS");
+    writer.write_pair(70, 0);
+    writer.write_pair(3, "Solid line");
+    writer.write_pair(72, 65);
+    writer.write_pair(73, 0);
+    writer.write_pair(40, 0.0);
+    
+    writer.write_pair(0, "ENDTAB");
+    
+    // LAYER 表
+    writer.write_pair(0, "TABLE");
+    writer.write_pair(2, "LAYER");
+    writer.write_handle_only();
+    writer.write_pair(70, document.layers.all_layers().len() as i32);
+    
+    for layer in document.layers.all_layers() {
+        writer.write_pair(0, "LAYER");
+        writer.write_handle_only();
+        writer.write_pair(2, &layer.name);
+        writer.write_pair(70, if layer.visible { 0 } else { 1 });
+        writer.write_pair(62, color_to_aci(&layer.color) as i32);
+        writer.write_pair(6, "CONTINUOUS");
+    }
+    
+    writer.write_pair(0, "ENDTAB");
+    
+    // BLOCK_RECORD 表
+    let model_handle = writer.new_handle();
+    let paper_handle = writer.new_handle();
+    
+    writer.write_pair(0, "TABLE");
+    writer.write_pair(2, "BLOCK_RECORD");
+    writer.write_handle_only();
+    writer.write_pair(70, 2 + document.layout_manager.layouts().len() as i32);
+    
+    // *Model_Space
+    writer.write_pair(0, "BLOCK_RECORD");
+    writer.write_pair(5, &model_handle);
+    writer.write_pair(2, "*Model_Space");
+    
+    // *Paper_Space
+    writer.write_pair(0, "BLOCK_RECORD");
+    writer.write_pair(5, &paper_handle);
+    writer.write_pair(2, "*Paper_Space");
+    
+    writer.write_pair(0, "ENDTAB");
+    
+    writer.end_section();
+}
+
+/// 写入 BLOCKS 段
+fn write_blocks_section(writer: &mut DxfWriter, _document: &Document) {
+    writer.begin_section("BLOCKS");
+    
+    // *Model_Space 块
+    writer.write_pair(0, "BLOCK");
+    writer.write_handle_only();
+    writer.write_pair(8, "0");
+    writer.write_pair(2, "*Model_Space");
+    writer.write_pair(70, 0);
+    writer.write_pair(10, 0.0);
+    writer.write_pair(20, 0.0);
+    writer.write_pair(30, 0.0);
+    writer.write_pair(0, "ENDBLK");
+    writer.write_handle_only();
+    writer.write_pair(8, "0");
+    
+    // *Paper_Space 块
+    writer.write_pair(0, "BLOCK");
+    writer.write_handle_only();
+    writer.write_pair(8, "0");
+    writer.write_pair(2, "*Paper_Space");
+    writer.write_pair(70, 0);
+    writer.write_pair(10, 0.0);
+    writer.write_pair(20, 0.0);
+    writer.write_pair(30, 0.0);
+    writer.write_pair(0, "ENDBLK");
+    writer.write_handle_only();
+    writer.write_pair(8, "0");
+    
+    writer.end_section();
+}
+
+/// 写入 ENTITIES 段
+fn write_entities_section(writer: &mut DxfWriter, document: &Document) {
+    writer.begin_section("ENTITIES");
+    
+    // 导出模型空间实体
+    for entity in document.all_entities() {
+        write_entity(writer, entity, false);
+    }
+    
+    // 导出视口和图纸空间实体
+    for layout in document.layout_manager.layouts() {
+        // 导出视口
+        for viewport in &layout.viewports {
+            write_viewport(writer, viewport);
+        }
+        
+        // 导出图纸空间实体
+        for entity in &layout.paper_space_entities {
+            write_entity(writer, entity, true);
+        }
+    }
+    
+    writer.end_section();
+}
+
+/// 写入单个实体
+fn write_entity(writer: &mut DxfWriter, entity: &Entity, is_paper_space: bool) {
+    match &entity.geometry {
+        Geometry::Line(line) => {
+            writer.write_pair(0, "LINE");
+            writer.write_handle_only();
+            if is_paper_space {
+                writer.write_pair(67, 1);
+            }
+            writer.write_pair(8, "0");
+            writer.write_pair(10, line.start.x);
+            writer.write_pair(20, line.start.y);
+            writer.write_pair(30, 0.0);
+            writer.write_pair(11, line.end.x);
+            writer.write_pair(21, line.end.y);
+            writer.write_pair(31, 0.0);
+        }
+        Geometry::Circle(circle) => {
+            writer.write_pair(0, "CIRCLE");
+            writer.write_handle_only();
+            if is_paper_space {
+                writer.write_pair(67, 1);
+            }
+            writer.write_pair(8, "0");
+            writer.write_pair(10, circle.center.x);
+            writer.write_pair(20, circle.center.y);
+            writer.write_pair(30, 0.0);
+            writer.write_pair(40, circle.radius);
+        }
+        Geometry::Arc(arc) => {
+            writer.write_pair(0, "ARC");
+            writer.write_handle_only();
+            if is_paper_space {
+                writer.write_pair(67, 1);
+            }
+            writer.write_pair(8, "0");
+            writer.write_pair(10, arc.center.x);
+            writer.write_pair(20, arc.center.y);
+            writer.write_pair(30, 0.0);
+            writer.write_pair(40, arc.radius);
+            writer.write_pair(50, arc.start_angle.to_degrees());
+            writer.write_pair(51, arc.end_angle.to_degrees());
+        }
+        Geometry::Polyline(polyline) => {
+            writer.write_pair(0, "LWPOLYLINE");
+            writer.write_handle_only();
+            if is_paper_space {
+                writer.write_pair(67, 1);
+            }
+            writer.write_pair(8, "0");
+            writer.write_pair(90, polyline.vertices.len() as i32);
+            writer.write_pair(70, if polyline.closed { 1 } else { 0 });
+            
+            for vertex in &polyline.vertices {
+                writer.write_pair(10, vertex.point.x);
+                writer.write_pair(20, vertex.point.y);
+                writer.write_pair(42, vertex.bulge);
+            }
+        }
+        Geometry::Text(text) => {
+            writer.write_pair(0, "TEXT");
+            writer.write_handle_only();
+            if is_paper_space {
+                writer.write_pair(67, 1);
+            }
+            writer.write_pair(8, "0");
+            writer.write_pair(10, text.position.x);
+            writer.write_pair(20, text.position.y);
+            writer.write_pair(30, 0.0);
+            writer.write_pair(40, text.height);
+            writer.write_pair(1, &text.content);
+            writer.write_pair(50, text.rotation.to_degrees());
+        }
+        _ => {
+            // 其他几何类型暂不支持
+        }
+    }
+}
+
+/// 写入视口
+fn write_viewport(writer: &mut DxfWriter, viewport: &Viewport) {
+    writer.write_pair(0, "VIEWPORT");
+    writer.write_handle_only();
+    writer.write_pair(67, 1); // 图纸空间标记
+    writer.write_pair(8, "0");
+    writer.write_pair(100, "AcDbEntity");
+    writer.write_pair(100, "AcDbViewport");
+    
+    // 视口中心（图纸空间）
+    let center_x = viewport.position.x + viewport.width / 2.0;
+    let center_y = viewport.position.y + viewport.height / 2.0;
+    writer.write_pair(10, center_x);
+    writer.write_pair(20, center_y);
+    writer.write_pair(30, 0.0);
+    
+    // 视口尺寸
+    writer.write_pair(40, viewport.width);
+    writer.write_pair(41, viewport.height);
+    
+    // 视口 ID
+    writer.write_pair(69, viewport.id.0 as i32 + 1);
+    
+    // 视图中心（模型空间）
+    writer.write_pair(12, viewport.view_center.x);
+    writer.write_pair(22, viewport.view_center.y);
+    
+    // 视图高度
+    writer.write_pair(45, viewport.height * viewport.scale);
+    
+    // 视口状态
+    let status = match viewport.status {
+        ViewportStatus::Active => 1,
+        ViewportStatus::Inactive => 1,
+        ViewportStatus::Locked => 1,
+        ViewportStatus::Hidden => 0,
+    };
+    writer.write_pair(68, status);
+    
+    // 标准标志
+    writer.write_pair(90, 32864);
+}
+
+/// 写入 OBJECTS 段
+fn write_objects_section(writer: &mut DxfWriter, document: &Document) {
+    writer.begin_section("OBJECTS");
+    
+    // 写入字典
+    let dict_handle = writer.new_handle();
+    writer.write_pair(0, "DICTIONARY");
+    writer.write_pair(5, &dict_handle);
+    writer.write_pair(100, "AcDbDictionary");
+    
+    // 布局字典
+    let layout_dict_handle = writer.new_handle();
+    writer.write_pair(3, "ACAD_LAYOUT");
+    writer.write_pair(350, &layout_dict_handle);
+    
+    // 布局字典内容
+    writer.write_pair(0, "DICTIONARY");
+    writer.write_pair(5, &layout_dict_handle);
+    writer.write_pair(100, "AcDbDictionary");
+    
+    // 写入每个布局
+    for layout in document.layout_manager.layouts() {
+        let layout_obj_handle = writer.new_handle();
+        writer.write_pair(3, &layout.name);
+        writer.write_pair(350, &layout_obj_handle);
+        
+        // 写入 LAYOUT 对象
+        write_layout_object(writer, layout, &layout_obj_handle, &layout_dict_handle);
+    }
+    
+    writer.end_section();
+}
+
+/// 写入 LAYOUT 对象
+fn write_layout_object(
+    writer: &mut DxfWriter,
+    layout: &Layout,
+    handle: &str,
+    owner_handle: &str,
+) {
+    let (width, height) = layout.paper_size.dimensions_mm();
+    
+    writer.write_pair(0, "LAYOUT");
+    writer.write_pair(5, handle);
+    writer.write_pair(330, owner_handle);
+    writer.write_pair(100, "AcDbPlotSettings");
+    
+    // 图纸设置
+    writer.write_pair(1, ""); // 页面设置名
+    writer.write_pair(2, "none_device"); // 打印机
+    writer.write_pair(4, ""); // 图纸尺寸名
+    
+    // 边距
+    writer.write_pair(40, layout.margins.3); // 左
+    writer.write_pair(41, layout.margins.2); // 下
+    writer.write_pair(42, layout.margins.1); // 右
+    writer.write_pair(43, layout.margins.0); // 上
+    
+    // 图纸尺寸
+    writer.write_pair(44, width);
+    writer.write_pair(45, height);
+    
+    writer.write_pair(100, "AcDbLayout");
+    
+    // 布局名称
+    writer.write_pair(1, &layout.name);
+    
+    // 布局标志
+    writer.write_pair(70, 1);
+    
+    // 布局顺序
+    writer.write_pair(71, layout.id.0 as i32);
 }
 
 /// 将ZCAD实体转换为DXF实体
