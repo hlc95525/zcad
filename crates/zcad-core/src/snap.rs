@@ -109,6 +109,26 @@ pub struct SnapConfig {
     pub show_markers: bool,
     /// 是否显示捕捉提示
     pub show_tooltips: bool,
+    
+    // ========== 极轴追踪 (Polar Tracking) ==========
+    /// 是否启用极轴追踪
+    pub polar_tracking: bool,
+    /// 极轴角度列表（弧度），如 0°, 15°, 30°, 45°, 60°, 75°, 90°
+    pub polar_angles: Vec<f64>,
+    /// 极轴追踪的容差（弧度）
+    pub polar_tolerance: f64,
+    
+    // ========== 延长线捕捉 (Extension Snap) ==========
+    /// 是否启用延长线捕捉
+    pub extension_snap: bool,
+    
+    // ========== 距离捕捉 (Distance Snap) ==========
+    /// 是否启用从端点的距离捕捉
+    pub distance_snap: bool,
+    /// 距离捕捉的距离值
+    pub snap_distance: f64,
+    /// 中点分段数（用于等分点捕捉）
+    pub middle_points: usize,
 }
 
 impl Default for SnapConfig {
@@ -119,6 +139,24 @@ impl Default for SnapConfig {
             grid_spacing: 10.0,
             show_markers: true,
             show_tooltips: true,
+            // 极轴追踪默认配置
+            polar_tracking: false,
+            polar_angles: vec![
+                0.0,
+                std::f64::consts::PI / 12.0,  // 15°
+                std::f64::consts::PI / 6.0,   // 30°
+                std::f64::consts::PI / 4.0,   // 45°
+                std::f64::consts::PI / 3.0,   // 60°
+                5.0 * std::f64::consts::PI / 12.0, // 75°
+                std::f64::consts::PI / 2.0,   // 90°
+            ],
+            polar_tolerance: std::f64::consts::PI / 180.0 * 5.0, // 5度容差
+            // 延长线捕捉
+            extension_snap: false,
+            // 距离捕捉
+            distance_snap: false,
+            snap_distance: 10.0,
+            middle_points: 1, // 默认只有一个中点
         }
     }
 }
@@ -926,6 +964,283 @@ impl SnapEngine {
         }
 
         intersections
+    }
+}
+
+impl SnapEngine {
+    // ========== 极轴追踪 ==========
+
+    /// 极轴追踪 - 捕捉到特定角度的线
+    ///
+    /// 参考 LibreCAD 的 snapToAngle 实现
+    ///
+    /// # 参数
+    /// - `coord`: 当前鼠标坐标
+    /// - `base`: 参考点（上一个点）
+    ///
+    /// # 返回
+    /// 如果当前点接近某个极轴角度，返回调整后的点
+    pub fn snap_to_polar(&self, coord: Point2, base: Point2) -> Option<SnapPoint> {
+        if !self.config.polar_tracking {
+            return None;
+        }
+
+        let delta = coord - base;
+        let dist = delta.norm();
+        
+        if dist < EPSILON {
+            return None;
+        }
+
+        let current_angle = delta.y.atan2(delta.x);
+        
+        // 检查每个极轴角度（考虑4个象限）
+        for &polar_angle in &self.config.polar_angles {
+            for quadrant in 0..4 {
+                let check_angle = polar_angle + (quadrant as f64) * std::f64::consts::FRAC_PI_2;
+                let normalized_check = Self::normalize_angle(check_angle);
+                let normalized_current = Self::normalize_angle(current_angle);
+                
+                let diff = (normalized_check - normalized_current).abs();
+                let diff = diff.min(2.0 * std::f64::consts::PI - diff);
+                
+                if diff <= self.config.polar_tolerance {
+                    // 捕捉到这个角度
+                    let snapped_point = Point2::new(
+                        base.x + dist * normalized_check.cos(),
+                        base.y + dist * normalized_check.sin(),
+                    );
+                    let snap_dist = (snapped_point - coord).norm();
+                    
+                    return Some(SnapPoint::new(
+                        snapped_point,
+                        SnapType::Grid, // 用 Grid 类型表示极轴捕捉
+                        None,
+                        snap_dist,
+                    ));
+                }
+            }
+        }
+        
+        None
+    }
+
+    /// 正交限制 - 限制为水平或垂直方向
+    pub fn restrict_orthogonal(&self, coord: Point2, base: Point2) -> Point2 {
+        let dx = (coord.x - base.x).abs();
+        let dy = (coord.y - base.y).abs();
+        
+        if dx > dy {
+            Point2::new(coord.x, base.y)
+        } else {
+            Point2::new(base.x, coord.y)
+        }
+    }
+
+    /// 水平限制
+    pub fn restrict_horizontal(&self, coord: Point2, base: Point2) -> Point2 {
+        Point2::new(coord.x, base.y)
+    }
+
+    /// 垂直限制
+    pub fn restrict_vertical(&self, coord: Point2, base: Point2) -> Point2 {
+        Point2::new(base.x, coord.y)
+    }
+
+    /// 角度限制 - 限制到指定角度
+    pub fn restrict_angle(&self, base: Point2, coord: Point2, angle: f64) -> Point2 {
+        let dist = (coord - base).norm();
+        Point2::new(
+            base.x + dist * angle.cos(),
+            base.y + dist * angle.sin(),
+        )
+    }
+
+    // ========== 延长线捕捉 ==========
+
+    /// 延长线捕捉 - 捕捉到线段延长线上的点
+    pub fn snap_to_extension(
+        &self,
+        mouse: Point2,
+        line: &Line,
+        tolerance: f64,
+    ) -> Option<SnapPoint> {
+        if !self.config.extension_snap {
+            return None;
+        }
+
+        let dir = line.direction();
+        
+        // 检查延长线起点方向
+        let t_start = (mouse - line.start).dot(&dir);
+        if t_start < 0.0 {
+            let projected = line.start + dir * t_start;
+            let dist = (projected - mouse).norm();
+            if dist <= tolerance {
+                return Some(SnapPoint::new(
+                    projected,
+                    SnapType::Nearest, // 用 Nearest 表示延长线捕捉
+                    None,
+                    dist,
+                ));
+            }
+        }
+        
+        // 检查延长线终点方向
+        let line_len = line.length();
+        let t_end = (mouse - line.start).dot(&dir);
+        if t_end > line_len {
+            let projected = line.start + dir * t_end;
+            let dist = (projected - mouse).norm();
+            if dist <= tolerance {
+                return Some(SnapPoint::new(
+                    projected,
+                    SnapType::Nearest,
+                    None,
+                    dist,
+                ));
+            }
+        }
+        
+        None
+    }
+
+    // ========== 距离捕捉 ==========
+
+    /// 从端点的距离捕捉
+    pub fn snap_to_distance_from_endpoint(
+        &self,
+        mouse: Point2,
+        line: &Line,
+        entity_id: EntityId,
+        tolerance: f64,
+    ) -> Vec<SnapPoint> {
+        if !self.config.distance_snap || self.config.snap_distance <= EPSILON {
+            return vec![];
+        }
+
+        let mut snaps = Vec::new();
+        let distance = self.config.snap_distance;
+        let dir = line.direction();
+        let line_len = line.length();
+
+        // 从起点的距离点
+        if distance < line_len {
+            let point = line.start + dir * distance;
+            let dist = (point - mouse).norm();
+            if dist <= tolerance {
+                snaps.push(SnapPoint::new(
+                    point,
+                    SnapType::Endpoint, // 用 Endpoint 表示
+                    Some(entity_id),
+                    dist,
+                ));
+            }
+        }
+
+        // 从终点的距离点
+        if distance < line_len {
+            let point = line.end - dir * distance;
+            let dist = (point - mouse).norm();
+            if dist <= tolerance {
+                snaps.push(SnapPoint::new(
+                    point,
+                    SnapType::Endpoint,
+                    Some(entity_id),
+                    dist,
+                ));
+            }
+        }
+
+        snaps
+    }
+
+    /// 等分点捕捉（扩展的中点捕捉）
+    pub fn snap_to_division_points(
+        &self,
+        mouse: Point2,
+        line: &Line,
+        entity_id: EntityId,
+        tolerance: f64,
+    ) -> Vec<SnapPoint> {
+        let mut snaps = Vec::new();
+        let divisions = self.config.middle_points + 1; // 分段数 = 中点数 + 1
+        
+        if divisions < 2 {
+            return snaps;
+        }
+
+        let dir = line.end - line.start;
+        
+        for i in 1..divisions {
+            let t = i as f64 / divisions as f64;
+            let point = line.start + dir * t;
+            let dist = (point - mouse).norm();
+            
+            if dist <= tolerance {
+                snaps.push(SnapPoint::new(
+                    point,
+                    SnapType::Midpoint,
+                    Some(entity_id),
+                    dist,
+                ));
+            }
+        }
+
+        snaps
+    }
+
+    // ========== 辅助方法 ==========
+
+    /// 归一化角度到 [0, 2π)
+    fn normalize_angle(angle: f64) -> f64 {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut a = angle % two_pi;
+        if a < 0.0 {
+            a += two_pi;
+        }
+        a
+    }
+
+    /// 设置极轴追踪角度（度数）
+    pub fn set_polar_angles_degrees(&mut self, angles: &[f64]) {
+        self.config.polar_angles = angles
+            .iter()
+            .map(|deg| deg.to_radians())
+            .collect();
+    }
+
+    /// 获取极轴追踪角度（度数）
+    pub fn get_polar_angles_degrees(&self) -> Vec<f64> {
+        self.config.polar_angles
+            .iter()
+            .map(|rad| rad.to_degrees())
+            .collect()
+    }
+
+    /// 切换极轴追踪
+    pub fn toggle_polar_tracking(&mut self) {
+        self.config.polar_tracking = !self.config.polar_tracking;
+    }
+
+    /// 切换延长线捕捉
+    pub fn toggle_extension_snap(&mut self) {
+        self.config.extension_snap = !self.config.extension_snap;
+    }
+
+    /// 切换距离捕捉
+    pub fn toggle_distance_snap(&mut self) {
+        self.config.distance_snap = !self.config.distance_snap;
+    }
+
+    /// 设置距离捕捉的距离值
+    pub fn set_snap_distance(&mut self, distance: f64) {
+        self.config.snap_distance = distance;
+    }
+
+    /// 设置中点分段数
+    pub fn set_middle_points(&mut self, count: usize) {
+        self.config.middle_points = count.max(1);
     }
 }
 
