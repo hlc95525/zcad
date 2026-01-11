@@ -26,6 +26,7 @@ pub mod buffer;
 pub mod entity;
 pub mod geometry;
 pub mod history;
+pub mod input_parser;
 pub mod layer;
 pub mod math;
 pub mod parametric;
@@ -44,6 +45,7 @@ pub mod prelude {
     pub use crate::geometry::{Arc, Circle, Geometry, Line, Point, Polyline, Text, TextAlignment};
     pub use crate::history::{HistoryTree, Operation, OperationId};
     pub use crate::layer::Layer;
+    pub use crate::input_parser::{InputParser, InputValue, ParseError};
     pub use crate::math::{Point2, Point3, Vector2, Vector3};
     pub use crate::parametric::{Constraint, ConstraintSystem, Variable};
     pub use crate::properties::{Color, LineType, Properties};

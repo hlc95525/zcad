@@ -7,12 +7,15 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use zcad_core::entity::Entity;
-use zcad_core::geometry::{Arc, Circle, Geometry, Line, Point, Polyline, Text};
+use zcad_core::geometry::{Arc, Circle, Dimension, Geometry, Line, Point, Polyline, Text};
+use zcad_core::input_parser::{InputParser, InputValue};
 use zcad_core::math::Point2;
 use zcad_core::properties::Color;
 use zcad_core::snap::SnapType;
+use zcad_core::transform::Transform2D;
 use zcad_file::Document;
-use zcad_ui::state::{DrawingTool, EditState, UiState};
+use zcad_ui::command_line::show_command_line;
+use zcad_ui::state::{Command, DrawingTool, EditState, InputType, UiState};
 
 /// ZCAD 应用程序
 struct ZcadApp {
@@ -221,10 +224,221 @@ impl ZcadApp {
             Geometry::Text(text) => {
                 self.draw_text(painter, rect, text, color);
             }
+            Geometry::Dimension(dim) => {
+                self.draw_dimension(painter, rect, dim, color);
+            }
         }
     }
 
-    /// 绘制文本
+    /// 绘制标注
+    fn draw_dimension(&self, painter: &egui::Painter, rect: &egui::Rect, dim: &Dimension, color: Color) {
+        let stroke_color = egui::Color32::from_rgb(color.r, color.g, color.b);
+        let stroke = egui::Stroke::new(1.0, stroke_color); // 标注线通常细一点
+
+        match dim.dim_type {
+            zcad_core::geometry::DimensionType::Aligned | zcad_core::geometry::DimensionType::Linear => {
+                // 简化的对齐标注逻辑
+                // 1. 计算标注线的方向向量 (平行于 p1->p2)
+                let dir = (dim.definition_point2 - dim.definition_point1).normalize();
+                // 2. 计算标注线的法向量 (垂直于 p1->p2)
+                let perp = zcad_core::math::Vector2::new(-dir.y, dir.x);
+                
+                // 3. 计算标注线在法向量方向上的投影距离
+                // 也就是 loc点 在 p1->p2 直线上的投影点 到 loc点的向量
+                // 简单做法：计算 loc 到 p1 的向量在 perp 上的投影
+                let v_loc = dim.line_location - dim.definition_point1;
+                let dist = v_loc.dot(&perp);
+                
+                // 4. 计算标注线的两个端点
+                let dim_p1 = dim.definition_point1 + perp * dist;
+                let dim_p2 = dim.definition_point2 + perp * dist;
+                
+                let dim_p1_s = self.world_to_screen(dim_p1, rect);
+                let dim_p2_s = self.world_to_screen(dim_p2, rect);
+                
+                // 绘制界线 (Extension lines)
+                // 从定义点画到标注线端点，再延伸一点点
+                let ext_offset = perp * (dist + 2.0 / self.camera_zoom * dist.signum()); // 延伸2mm
+                let ext_p1 = dim.definition_point1 + ext_offset;
+                let ext_p2 = dim.definition_point2 + ext_offset;
+                
+                // 界线起点要稍微离开定义点一点 (offset from origin)
+                let origin_offset = perp * (1.0 / self.camera_zoom * dist.signum());
+                let def_p1_off = dim.definition_point1 + origin_offset;
+                let def_p2_off = dim.definition_point2 + origin_offset;
+                
+                painter.line_segment([self.world_to_screen(def_p1_off, rect), self.world_to_screen(ext_p1, rect)], stroke);
+                painter.line_segment([self.world_to_screen(def_p2_off, rect), self.world_to_screen(ext_p2, rect)], stroke);
+                
+                // 绘制尺寸线 (Dimension line)
+                painter.line_segment([dim_p1_s, dim_p2_s], stroke);
+                
+                // 绘制箭头
+                self.draw_arrow(painter, dim_p1_s, dim_p2_s, stroke);
+                self.draw_arrow(painter, dim_p2_s, dim_p1_s, stroke);
+                
+                // 绘制文本
+                let text_content = dim.display_text();
+                // 如果是直径符号，替换显示
+                let text_content = text_content.replace("%%C", "Ø");
+                
+                // 使用 Dimension 中存储的文本位置（如果存在），否则使用默认计算位置
+                let mid_point = dim.get_text_position();
+                
+                // 计算旋转角度
+                let diff = dim.definition_point2 - dim.definition_point1;
+                let mut angle = diff.y.atan2(diff.x);
+                // 标准化角度：保持文字直立（从底部或右侧可读）
+                if angle.abs() > std::f64::consts::FRAC_PI_2 {
+                    angle += std::f64::consts::PI;
+                }
+                // 再次检查以确保在 (-PI/2, PI/2] 范围内
+                if angle > std::f64::consts::FRAC_PI_2 {
+                    angle -= std::f64::consts::PI * 2.0;
+                }
+
+                self.draw_dimension_text(painter, rect, mid_point, &text_content, dim.text_height, stroke_color, angle as f32);
+            }
+            zcad_core::geometry::DimensionType::Radius => {
+                // 半径标注：p1=圆心, p2=圆上一点, location=文本位置
+                let center = dim.definition_point1;
+                // let point_on_circle = dim.definition_point2;
+                // let text_pos = dim.line_location; // DEPRECATED: use get_text_position
+                let text_pos = dim.get_text_position();
+                
+                let radius = (dim.definition_point2 - center).norm();
+                let dir = (text_pos - center).normalize();
+                
+                // 箭头位置在圆弧上
+                let arrow_pos = center + dir * radius;
+                
+                let center_s = self.world_to_screen(center, rect);
+                let text_pos_s = self.world_to_screen(text_pos, rect);
+                let arrow_pos_s = self.world_to_screen(arrow_pos, rect);
+                
+                // 绘制从圆心到文本位置的线（或者只画箭头到文本）
+                // 通常只画圆心标记和从圆上到文本的线
+                painter.circle_filled(center_s, 2.0, stroke_color); // 圆心标记
+                
+                painter.line_segment([center_s, text_pos_s], stroke);
+                
+                // 绘制箭头（指向圆弧）
+                // 箭头方向：从圆心指向圆外
+                self.draw_arrow(painter, center_s, arrow_pos_s, stroke);
+                
+                // 绘制文本
+                let text_content = dim.display_text();
+                
+                // 计算旋转角度：沿半径方向
+                let diff = text_pos - center;
+                let mut angle = diff.y.atan2(diff.x);
+                if angle.abs() > std::f64::consts::FRAC_PI_2 {
+                    angle += std::f64::consts::PI;
+                }
+                if angle > std::f64::consts::FRAC_PI_2 {
+                    angle -= std::f64::consts::PI * 2.0;
+                }
+                
+                self.draw_dimension_text(painter, rect, text_pos, &text_content, dim.text_height, stroke_color, angle as f32);
+            }
+            zcad_core::geometry::DimensionType::Diameter => {
+                // 直径标注：p1=圆心, p2=圆上一点
+                let center = dim.definition_point1;
+                let p2 = dim.definition_point2;
+                // 计算对径点
+                let p1 = center - (p2 - center);
+                
+                let p1_s = self.world_to_screen(p1, rect);
+                let p2_s = self.world_to_screen(p2, rect);
+                
+                // 绘制直径线
+                painter.line_segment([p1_s, p2_s], stroke);
+                
+                // 绘制箭头（向外）
+                let center_s = self.world_to_screen(center, rect);
+                self.draw_arrow(painter, center_s, p1_s, stroke);
+                self.draw_arrow(painter, center_s, p2_s, stroke);
+                
+                // 文本位置
+                let text_pos = dim.get_text_position();
+                
+                // 如果文本不在直线上，画引线
+                // 这里简单起见，画在中心
+                 let text_content = dim.display_text().replace("%%C", "Ø");
+                 
+                 // 计算旋转角度：沿直径方向
+                 let diff = p2 - p1;
+                 let mut angle = diff.y.atan2(diff.x);
+                 if angle.abs() > std::f64::consts::FRAC_PI_2 {
+                    angle += std::f64::consts::PI;
+                 }
+                 if angle > std::f64::consts::FRAC_PI_2 {
+                    angle -= std::f64::consts::PI * 2.0;
+                 }
+                 
+                 self.draw_dimension_text(painter, rect, text_pos, &text_content, dim.text_height, stroke_color, angle as f32);
+            }
+        }
+    }
+    
+    /// 绘制箭头
+    fn draw_arrow(&self, painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, stroke: egui::Stroke) {
+        let arrow_len = 10.0;
+        let dir = (to - from).normalized();
+        if dir.length() > 0.0 {
+            let arrow1_end = to - dir * arrow_len + egui::vec2(-dir.y, dir.x) * arrow_len * 0.3;
+            let arrow1_end2 = to - dir * arrow_len - egui::vec2(-dir.y, dir.x) * arrow_len * 0.3;
+            painter.line_segment([to, arrow1_end], stroke);
+            painter.line_segment([to, arrow1_end2], stroke);
+        }
+    }
+    
+    /// 绘制标注文本
+    fn draw_dimension_text(&self, painter: &egui::Painter, rect: &egui::Rect, world_pos: Point2, text: &str, height: f64, color: egui::Color32, angle: f32) {
+        let font_id = egui::FontId::proportional((height * self.camera_zoom) as f32);
+        let galley = painter.layout_no_wrap(text.to_string(), font_id, color);
+        
+        let text_screen_pos = self.world_to_screen(world_pos, rect);
+        
+        let galley_size = galley.rect.size();
+        let half_size = galley_size * 0.5;
+        
+        // 计算旋转后的左上角位置（相对于中心）
+        // P = Center - Rot * half_size
+        let rot = egui::emath::Rot2::from_angle(angle);
+        let offset = rot * half_size;
+        let draw_pos = text_screen_pos - offset;
+        
+        // 绘制背景（旋转的矩形）
+        let bg_expand = 2.0;
+        let bg_half_size = half_size + egui::vec2(bg_expand, bg_expand);
+        
+        let corners = [
+            text_screen_pos + rot * egui::vec2(-bg_half_size.x, -bg_half_size.y),
+            text_screen_pos + rot * egui::vec2(bg_half_size.x, -bg_half_size.y),
+            text_screen_pos + rot * egui::vec2(bg_half_size.x, bg_half_size.y),
+            text_screen_pos + rot * egui::vec2(-bg_half_size.x, bg_half_size.y),
+        ];
+        
+        painter.add(egui::Shape::convex_polygon(
+            corners.to_vec(),
+            egui::Color32::from_rgb(30, 30, 46), // 背景色
+            egui::Stroke::NONE,
+        ));
+        
+        // 绘制文本
+        painter.add(egui::Shape::Text(egui::epaint::TextShape {
+            pos: draw_pos,
+            galley,
+            underline: egui::Stroke::NONE,
+            override_text_color: Some(color),
+            angle: angle,
+            fallback_color: color,
+            opacity_factor: 1.0,
+        }));
+    }
+
+    /// 绘制文本（原函数保留）
     fn draw_text(&self, painter: &egui::Painter, rect: &egui::Rect, text: &Text, color: Color) {
         let screen_pos = self.world_to_screen(text.position, rect);
         let screen_height = (text.height * self.camera_zoom) as f32;
@@ -416,9 +630,9 @@ impl ZcadApp {
         // 获取当前视图内的实体
         let entities: Vec<&Entity> = self.document.all_entities().collect();
 
-        // 获取参考点（绘图状态下的起始点）
+        // 获取参考点（绘图状态下的最后一个点）
         let reference_point = match &self.ui_state.edit_state {
-            EditState::Drawing { points, .. } if !points.is_empty() => Some(points[0]),
+            EditState::Drawing { points, .. } if !points.is_empty() => points.last().copied(),
             _ => None,
         };
 
@@ -431,7 +645,7 @@ impl ZcadApp {
         );
 
         // 特殊处理：绘制多段线时，检查是否接近起点（用于闭合）
-        if let EditState::Drawing { tool: DrawingTool::Polyline, points } = &self.ui_state.edit_state {
+        if let EditState::Drawing { tool: DrawingTool::Polyline, points, .. } = &self.ui_state.edit_state {
             if points.len() >= 2 {
                 let start_point = points[0];
                 let world_tolerance = self.ui_state.snap_state.config().tolerance / self.camera_zoom;
@@ -457,7 +671,7 @@ impl ZcadApp {
         }
 
         // 同样处理圆弧：可以捕捉到第一个点
-        if let EditState::Drawing { tool: DrawingTool::Arc, points } = &self.ui_state.edit_state {
+        if let EditState::Drawing { tool: DrawingTool::Arc, points, .. } = &self.ui_state.edit_state {
             if !points.is_empty() {
                 let first_point = points[0];
                 let world_tolerance = self.ui_state.snap_state.config().tolerance / self.camera_zoom;
@@ -521,7 +735,7 @@ impl ZcadApp {
 
     /// 绘制预览
     fn draw_preview(&self, painter: &egui::Painter, rect: &egui::Rect) {
-        if let EditState::Drawing { tool, points } = &self.ui_state.edit_state {
+        if let EditState::Drawing { tool, points, .. } = &self.ui_state.edit_state {
             if points.is_empty() {
                 return;
             }
@@ -531,6 +745,41 @@ impl ZcadApp {
             let mouse_pos = self.get_effective_draw_point();
 
             match tool {
+                DrawingTool::Dimension => {
+                    if points.len() == 1 {
+                        // 只有一个点，显示到鼠标的直线，模拟正在找第二点
+                        let line = Line::new(points[0], mouse_pos);
+                        self.draw_geometry(painter, rect, &Geometry::Line(line), preview_color);
+                    } else if points.len() == 2 {
+                        // 有两个点，显示标注预览
+                        let dim = Dimension::new(points[0], points[1], mouse_pos);
+                        self.draw_dimension(painter, rect, &dim, preview_color);
+                    }
+                }
+                DrawingTool::DimensionRadius => {
+                    if points.len() == 2 {
+                         // points[0] = center, points[1] = point on circle
+                         let mut dim = Dimension::new(points[0], points[1], mouse_pos);
+                         dim.dim_type = zcad_core::geometry::DimensionType::Radius;
+                         self.draw_dimension(painter, rect, &dim, preview_color);
+                    }
+                }
+                DrawingTool::DimensionDiameter => {
+                    if points.len() == 2 {
+                         // points[0] = center, points[1] = point representing radius
+                         let center = points[0];
+                         let radius = (points[1] - center).norm();
+                         let text_pos = mouse_pos;
+                         
+                         let dir = (text_pos - center).normalize();
+                         let p1 = center - dir * radius;
+                         let p2 = center + dir * radius;
+                         
+                         let mut dim = Dimension::new(p1, p2, text_pos);
+                         dim.dim_type = zcad_core::geometry::DimensionType::Diameter;
+                         self.draw_dimension(painter, rect, &dim, preview_color);
+                    }
+                }
                 DrawingTool::Line => {
                     let line = Line::new(*points.last().unwrap(), mouse_pos);
                     self.draw_geometry(painter, rect, &Geometry::Line(line), preview_color);
@@ -589,17 +838,108 @@ impl ZcadApp {
             }
         }
         
-        // 移动预览
-        if let EditState::MovingEntities { start_pos, entity_ids } = &self.ui_state.edit_state {
-            let preview_color = Color::from_hex(0x00FFFF); // 青色
-            let mouse_pos = self.ui_state.mouse_world_pos;
-            let offset = mouse_pos - *start_pos;
-            
-            for id in entity_ids {
-                if let Some(entity) = self.document.get_entity(id) {
-                    let mut preview_geom = entity.geometry.clone();
-                    self.apply_offset_to_geometry_preview(&mut preview_geom, offset);
-                    self.draw_geometry(painter, rect, &preview_geom, preview_color);
+        // 移动/复制预览
+        if let EditState::MoveOp { entity_ids, base_point } | EditState::CopyOp { entity_ids, base_point } = &self.ui_state.edit_state {
+            if let Some(base) = base_point {
+                let preview_color = Color::from_hex(0x00FFFF); // 青色
+                let mouse_pos = self.get_effective_draw_point(); // 使用捕捉
+                let offset = mouse_pos - *base;
+                
+                for id in entity_ids {
+                    if let Some(entity) = self.document.get_entity(id) {
+                        let mut preview_geom = entity.geometry.clone();
+                        self.apply_offset_to_geometry(&mut preview_geom, offset);
+                        self.draw_geometry(painter, rect, &preview_geom, preview_color);
+                    }
+                }
+                
+                // 绘制连接线
+                let base_screen = self.world_to_screen(*base, rect);
+                let mouse_screen = self.world_to_screen(mouse_pos, rect);
+                painter.line_segment(
+                    [base_screen, mouse_screen],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)),
+                );
+            }
+        }
+        
+        // 旋转预览
+        if let EditState::RotateOp { entity_ids, center, start_angle: _ } = &self.ui_state.edit_state {
+            if let Some(center) = center {
+                let preview_color = Color::from_hex(0x00FFFF);
+                let mouse_pos = self.get_effective_draw_point();
+                let angle = (mouse_pos.y - center.y).atan2(mouse_pos.x - center.x);
+                let transform = Transform2D::rotation_around(*center, angle);
+                
+                for id in entity_ids {
+                    if let Some(entity) = self.document.get_entity(id) {
+                        let mut preview_geom = entity.geometry.clone();
+                        self.apply_transform_to_geometry(&mut preview_geom, &transform);
+                        self.draw_geometry(painter, rect, &preview_geom, preview_color);
+                    }
+                }
+                
+                // 绘制参考线
+                let center_screen = self.world_to_screen(*center, rect);
+                let mouse_screen = self.world_to_screen(mouse_pos, rect);
+                painter.line_segment(
+                    [center_screen, mouse_screen],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)),
+                );
+            }
+        }
+        
+        // 缩放预览
+        if let EditState::ScaleOp { entity_ids, center, start_dist: _ } = &self.ui_state.edit_state {
+            if let Some(center) = center {
+                let preview_color = Color::from_hex(0x00FFFF);
+                let mouse_pos = self.get_effective_draw_point();
+                let dist = (mouse_pos - center).norm();
+                let scale = if dist < 0.001 { 1.0 } else { dist };
+                let transform = Transform2D::scale_around(*center, scale, scale);
+                
+                for id in entity_ids {
+                    if let Some(entity) = self.document.get_entity(id) {
+                        let mut preview_geom = entity.geometry.clone();
+                        self.apply_transform_to_geometry(&mut preview_geom, &transform);
+                        self.draw_geometry(painter, rect, &preview_geom, preview_color);
+                    }
+                }
+                
+                // 绘制参考线
+                let center_screen = self.world_to_screen(*center, rect);
+                let mouse_screen = self.world_to_screen(mouse_pos, rect);
+                painter.line_segment(
+                    [center_screen, mouse_screen],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100)),
+                );
+            }
+        }
+        
+        // 镜像预览
+        if let EditState::MirrorOp { entity_ids, point1 } = &self.ui_state.edit_state {
+            if let Some(p1) = point1 {
+                let preview_color = Color::from_hex(0x00FFFF);
+                let mouse_pos = self.get_effective_draw_point();
+                
+                if (*p1 - mouse_pos).norm() > 0.001 {
+                    let transform = Transform2D::mirror_line(*p1, mouse_pos);
+                    
+                    for id in entity_ids {
+                        if let Some(entity) = self.document.get_entity(id) {
+                            let mut preview_geom = entity.geometry.clone();
+                            self.apply_transform_to_geometry(&mut preview_geom, &transform);
+                            self.draw_geometry(painter, rect, &preview_geom, preview_color);
+                        }
+                    }
+                    
+                    // 绘制镜像轴
+                    let p1_screen = self.world_to_screen(*p1, rect);
+                    let p2_screen = self.world_to_screen(mouse_pos, rect);
+                    painter.line_segment(
+                        [p1_screen, p2_screen],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 128, 0)), // 橙色镜像轴
+                    );
                 }
             }
         }
@@ -629,6 +969,11 @@ impl ZcadApp {
             Geometry::Text(t) => {
                 t.position = t.position + offset;
             }
+            Geometry::Dimension(d) => {
+                d.definition_point1 = d.definition_point1 + offset;
+                d.definition_point2 = d.definition_point2 + offset;
+                d.line_location = d.line_location + offset;
+            }
         }
     }
 
@@ -643,36 +988,41 @@ impl ZcadApp {
                     self.ui_state.edit_state = EditState::Drawing {
                         tool: DrawingTool::Line,
                         points: vec![world_pos],
+                        expected_input: Some(InputType::Point),
                     };
-                    self.ui_state.status_message = "指定下一点:".to_string();
+                    self.ui_state.status_message = "指定下一点 (或输入坐标/长度+角度):".to_string();
                 }
                 DrawingTool::Circle => {
                     self.ui_state.edit_state = EditState::Drawing {
                         tool: DrawingTool::Circle,
                         points: vec![world_pos],
+                        expected_input: Some(InputType::Radius),
                     };
-                    self.ui_state.status_message = "指定半径:".to_string();
+                    self.ui_state.status_message = "指定半径 (或输入数值/点坐标):".to_string();
                 }
                 DrawingTool::Rectangle => {
                     self.ui_state.edit_state = EditState::Drawing {
                         tool: DrawingTool::Rectangle,
                         points: vec![world_pos],
+                        expected_input: Some(InputType::Point),
                     };
-                    self.ui_state.status_message = "指定对角点:".to_string();
+                    self.ui_state.status_message = "指定对角点 (或输入坐标/尺寸):".to_string();
                 }
                 DrawingTool::Arc => {
                     self.ui_state.edit_state = EditState::Drawing {
                         tool: DrawingTool::Arc,
                         points: vec![world_pos],
+                        expected_input: Some(InputType::Point),
                     };
-                    self.ui_state.status_message = "圆弧: 指定第二点:".to_string();
+                    self.ui_state.status_message = "圆弧: 指定第二点 (或输入坐标):".to_string();
                 }
                 DrawingTool::Polyline => {
                     self.ui_state.edit_state = EditState::Drawing {
                         tool: DrawingTool::Polyline,
                         points: vec![world_pos],
+                        expected_input: Some(InputType::Point),
                     };
-                    self.ui_state.status_message = "多段线: 指定下一点 (右键结束):".to_string();
+                    self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 或输入坐标/长度+角度):".to_string();
                 }
                 DrawingTool::Point => {
                     // 点直接创建，不需要绘图状态
@@ -690,6 +1040,83 @@ impl ZcadApp {
                     };
                     self.ui_state.status_message = "输入文本内容，按 Enter 确认:".to_string();
                 }
+                DrawingTool::Dimension => {
+                    self.ui_state.edit_state = EditState::Drawing {
+                        tool: DrawingTool::Dimension,
+                        points: vec![world_pos],
+                        expected_input: Some(InputType::Point),
+                    };
+                    self.ui_state.status_message = "标注: 指定第二个点:".to_string();
+                }
+                DrawingTool::DimensionRadius => {
+                    // 尝试拾取圆或圆弧
+                    let hits = self.document.query_point(&world_pos, 5.0 / self.camera_zoom);
+                    if let Some(entity) = hits.first() {
+                         match &entity.geometry {
+                             Geometry::Circle(c) => {
+                                 let p1 = c.center;
+                                 let dir = (world_pos - c.center).normalize();
+                                 let p2 = c.center + dir * c.radius;
+                                 self.ui_state.edit_state = EditState::Drawing {
+                                     tool: DrawingTool::DimensionRadius,
+                                     points: vec![p1, p2],
+                                     expected_input: Some(InputType::Point),
+                                 };
+                                 self.ui_state.status_message = "半径标注: 指定文本位置:".to_string();
+                             }
+                             Geometry::Arc(a) => {
+                                 let p1 = a.center;
+                                 let dir = (world_pos - a.center).normalize();
+                                 let p2 = a.center + dir * a.radius;
+                                 self.ui_state.edit_state = EditState::Drawing {
+                                     tool: DrawingTool::DimensionRadius,
+                                     points: vec![p1, p2],
+                                     expected_input: Some(InputType::Point),
+                                 };
+                                 self.ui_state.status_message = "半径标注: 指定文本位置:".to_string();
+                             }
+                             _ => {
+                                 self.ui_state.status_message = "请选择圆或圆弧".to_string();
+                             }
+                         }
+                    } else {
+                        self.ui_state.status_message = "请选择圆或圆弧".to_string();
+                    }
+                }
+                DrawingTool::DimensionDiameter => {
+                    // 尝试拾取圆或圆弧
+                    let hits = self.document.query_point(&world_pos, 5.0 / self.camera_zoom);
+                    if let Some(entity) = hits.first() {
+                         match &entity.geometry {
+                             Geometry::Circle(c) => {
+                                 let center = c.center;
+                                 // Store center and a point representing radius
+                                 let p_rad = c.center + zcad_core::math::Vector2::new(c.radius, 0.0); 
+                                 self.ui_state.edit_state = EditState::Drawing {
+                                     tool: DrawingTool::DimensionDiameter,
+                                     points: vec![center, p_rad],
+                                     expected_input: Some(InputType::Point),
+                                 };
+                                 self.ui_state.status_message = "直径标注: 指定文本位置:".to_string();
+                             }
+                             Geometry::Arc(a) => {
+                                 let center = a.center;
+                                 let p_rad = a.center + zcad_core::math::Vector2::new(a.radius, 0.0);
+                                 self.ui_state.edit_state = EditState::Drawing {
+                                     tool: DrawingTool::DimensionDiameter,
+                                     points: vec![center, p_rad],
+                                     expected_input: Some(InputType::Point),
+                                 };
+                                 self.ui_state.status_message = "直径标注: 指定文本位置:".to_string();
+                             }
+                             _ => {
+                                 self.ui_state.status_message = "请选择圆或圆弧".to_string();
+                             }
+                         }
+                    } else {
+                        self.ui_state.status_message = "请选择圆或圆弧".to_string();
+                    }
+                }
                 DrawingTool::Select => {
                     let hits = self.document.query_point(&world_pos, 5.0 / self.camera_zoom);
                     self.ui_state.clear_selection();
@@ -702,7 +1129,127 @@ impl ZcadApp {
                 }
                 DrawingTool::None => {}
             },
-            EditState::Drawing { tool, points } => {
+            EditState::MoveOp { entity_ids, base_point } => {
+                if base_point.is_none() {
+                    self.ui_state.edit_state = EditState::MoveOp {
+                        entity_ids: entity_ids.clone(),
+                        base_point: Some(world_pos),
+                    };
+                    self.ui_state.status_message = "移动: 指定第二点:".to_string();
+                } else {
+                    let offset = world_pos - base_point.unwrap();
+                    for id in entity_ids {
+                        if let Some(entity) = self.document.get_entity(id) {
+                            let mut new_entity = entity.clone();
+                            self.apply_offset_to_geometry(&mut new_entity.geometry, offset);
+                            self.document.update_entity(id, new_entity);
+                        }
+                    }
+                    self.ui_state.status_message = "移动完成".to_string();
+                    self.ui_state.edit_state = EditState::Idle;
+                }
+            }
+            EditState::CopyOp { entity_ids, base_point } => {
+                if base_point.is_none() {
+                    self.ui_state.edit_state = EditState::CopyOp {
+                        entity_ids: entity_ids.clone(),
+                        base_point: Some(world_pos),
+                    };
+                    self.ui_state.status_message = "复制: 指定第二点:".to_string();
+                } else {
+                    let offset = world_pos - base_point.unwrap();
+                    for id in entity_ids {
+                        if let Some(entity) = self.document.get_entity(id) {
+                            let mut new_entity = entity.clone();
+                            self.apply_offset_to_geometry(&mut new_entity.geometry, offset);
+                            // 复制创建新实体
+                            self.document.add_entity(new_entity);
+                        }
+                    }
+                    self.ui_state.status_message = "复制完成".to_string();
+                    self.ui_state.edit_state = EditState::Idle;
+                }
+            }
+            EditState::RotateOp { entity_ids, center, start_angle: _ } => {
+                if center.is_none() {
+                    self.ui_state.edit_state = EditState::RotateOp {
+                        entity_ids: entity_ids.clone(),
+                        center: Some(world_pos),
+                        start_angle: None, // 可以后续优化为相对旋转
+                    };
+                    self.ui_state.status_message = "旋转: 指定旋转角度 (或点):".to_string();
+                } else {
+                    let center = center.unwrap();
+                    let angle = (world_pos.y - center.y).atan2(world_pos.x - center.x);
+                    let transform = Transform2D::rotation_around(center, angle);
+                    
+                    for id in entity_ids {
+                        if let Some(entity) = self.document.get_entity(id) {
+                            let mut new_entity = entity.clone();
+                            self.apply_transform_to_geometry(&mut new_entity.geometry, &transform);
+                            self.document.update_entity(id, new_entity);
+                        }
+                    }
+                    self.ui_state.status_message = "旋转完成".to_string();
+                    self.ui_state.edit_state = EditState::Idle;
+                }
+            }
+            EditState::ScaleOp { entity_ids, center, start_dist: _ } => {
+                if center.is_none() {
+                    self.ui_state.edit_state = EditState::ScaleOp {
+                        entity_ids: entity_ids.clone(),
+                        center: Some(world_pos),
+                        start_dist: None,
+                    };
+                    self.ui_state.status_message = "缩放: 指定缩放比例 (距离):".to_string();
+                } else {
+                    let center = center.unwrap();
+                    let dist = (world_pos - center).norm();
+                    let scale = if dist < 0.001 { 1.0 } else { dist }; // 简单使用距离作为比例
+                    
+                    let transform = Transform2D::scale_around(center, scale, scale);
+                    
+                    for id in entity_ids {
+                        if let Some(entity) = self.document.get_entity(id) {
+                            let mut new_entity = entity.clone();
+                            self.apply_transform_to_geometry(&mut new_entity.geometry, &transform);
+                            self.document.update_entity(id, new_entity);
+                        }
+                    }
+                    self.ui_state.status_message = "缩放完成".to_string();
+                    self.ui_state.edit_state = EditState::Idle;
+                }
+            }
+            EditState::MirrorOp { entity_ids, point1 } => {
+                if point1.is_none() {
+                    self.ui_state.edit_state = EditState::MirrorOp {
+                        entity_ids: entity_ids.clone(),
+                        point1: Some(world_pos),
+                    };
+                    self.ui_state.status_message = "镜像: 指定镜像线第二点:".to_string();
+                } else {
+                    let p1 = point1.unwrap();
+                    let p2 = world_pos;
+                    
+                    if (p1 - p2).norm() > 0.001 {
+                        let transform = Transform2D::mirror_line(p1, p2);
+                        
+                        for id in entity_ids {
+                            if let Some(entity) = self.document.get_entity(id) {
+                                let mut new_entity = entity.clone();
+                                self.apply_transform_to_geometry(&mut new_entity.geometry, &transform);
+                                // 镜像通常删除源对象，还是保留？AutoCAD默认询问。这里默认删除（移动式镜像）
+                                // 如果要保留源对象，应该 add_entity
+                                // 这里为了简单，默认替换（Move-Mirror）
+                                self.document.update_entity(id, new_entity);
+                            }
+                        }
+                        self.ui_state.status_message = "镜像完成".to_string();
+                    }
+                    self.ui_state.edit_state = EditState::Idle;
+                }
+            }
+            EditState::Drawing { tool, points, expected_input: _ } => {
                 let tool = *tool;
                 let mut new_points = points.clone();
                 new_points.push(world_pos);
@@ -716,8 +1263,9 @@ impl ZcadApp {
                             self.ui_state.edit_state = EditState::Drawing {
                                 tool: DrawingTool::Line,
                                 points: vec![new_points[1]],
+                                expected_input: Some(InputType::Point),
                             };
-                            self.ui_state.status_message = "直线已创建。下一点:".to_string();
+                            self.ui_state.status_message = "直线已创建。下一点 (或输入坐标/长度+角度):".to_string();
                         }
                     }
                     DrawingTool::Circle => {
@@ -756,8 +1304,9 @@ impl ZcadApp {
                             self.ui_state.edit_state = EditState::Drawing {
                                 tool: DrawingTool::Arc,
                                 points: new_points,
+                                expected_input: Some(InputType::Point),
                             };
-                            self.ui_state.status_message = "圆弧: 指定终点:".to_string();
+                            self.ui_state.status_message = "圆弧: 指定终点 (或输入坐标):".to_string();
                         } else if new_points.len() >= 3 {
                             // 三个点，创建圆弧
                             if let Some(arc) = Arc::from_three_points(
@@ -797,8 +1346,60 @@ impl ZcadApp {
                         self.ui_state.edit_state = EditState::Drawing {
                             tool: DrawingTool::Polyline,
                             points: new_points,
+                            expected_input: Some(InputType::Point),
                         };
-                        self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合):".to_string();
+                        self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合, 或输入坐标/长度+角度):".to_string();
+                    }
+                    DrawingTool::Dimension => {
+                        if new_points.len() == 2 {
+                            // 第二个点已指定，等待第三个点（位置）
+                            self.ui_state.edit_state = EditState::Drawing {
+                                tool: DrawingTool::Dimension,
+                                points: new_points,
+                                expected_input: Some(InputType::Point),
+                            };
+                            self.ui_state.status_message = "标注: 指定标注线位置:".to_string();
+                        } else if new_points.len() == 3 {
+                            // 第三个点已指定，创建标注
+                            let dim = Dimension::new(new_points[0], new_points[1], new_points[2]);
+                            let entity = Entity::new(Geometry::Dimension(dim));
+                            self.document.add_entity(entity);
+                            self.ui_state.edit_state = EditState::Idle;
+                            self.ui_state.status_message = "标注已创建".to_string();
+                        }
+                    }
+                    DrawingTool::DimensionRadius => {
+                        if new_points.len() == 3 {
+                            let mut dim = Dimension::new(new_points[0], new_points[1], new_points[2]);
+                            dim.dim_type = zcad_core::geometry::DimensionType::Radius;
+                            let entity = Entity::new(Geometry::Dimension(dim));
+                            self.document.add_entity(entity);
+                            self.ui_state.edit_state = EditState::Idle;
+                            self.ui_state.status_message = "半径标注已创建".to_string();
+                        }
+                    }
+                    DrawingTool::DimensionDiameter => {
+                        if new_points.len() == 3 {
+                            let center = new_points[0];
+                            let p_rad = new_points[1];
+                            let text_pos = new_points[2];
+                            
+                            let radius = (p_rad - center).norm();
+                            let dir = if (text_pos - center).norm() > 0.001 {
+                                (text_pos - center).normalize()
+                            } else {
+                                zcad_core::math::Vector2::x()
+                            };
+                            
+                            let p2 = center + dir * radius;
+                            
+                            let mut dim = Dimension::new(center, p2, text_pos);
+                            dim.dim_type = zcad_core::geometry::DimensionType::Diameter;
+                            let entity = Entity::new(Geometry::Dimension(dim));
+                            self.document.add_entity(entity);
+                            self.ui_state.edit_state = EditState::Idle;
+                            self.ui_state.status_message = "直径标注已创建".to_string();
+                        }
                     }
                     _ => {}
                 }
@@ -809,7 +1410,7 @@ impl ZcadApp {
 
     /// 处理右键点击（结束多段线等）
     fn handle_right_click(&mut self) {
-        if let EditState::Drawing { tool, points } = &self.ui_state.edit_state {
+        if let EditState::Drawing { tool, points, .. } = &self.ui_state.edit_state {
             match tool {
                 DrawingTool::Polyline => {
                     if points.len() >= 2 {
@@ -917,6 +1518,57 @@ impl ZcadApp {
             Geometry::Text(t) => {
                 t.position = t.position + offset;
             }
+            Geometry::Dimension(d) => {
+                d.definition_point1 = d.definition_point1 + offset;
+                d.definition_point2 = d.definition_point2 + offset;
+                d.line_location = d.line_location + offset;
+            }
+        }
+    }
+
+    /// 对几何体应用变换
+    fn apply_transform_to_geometry(&self, geometry: &mut Geometry, transform: &Transform2D) {
+        match geometry {
+            Geometry::Point(p) => {
+                p.position = transform.transform_point(&p.position);
+            }
+            Geometry::Line(l) => {
+                l.start = transform.transform_point(&l.start);
+                l.end = transform.transform_point(&l.end);
+            }
+            Geometry::Circle(c) => {
+                c.center = transform.transform_point(&c.center);
+                let (sx, sy) = transform.scale_component();
+                c.radius *= (sx + sy) / 2.0;
+            }
+            Geometry::Arc(a) => {
+                a.center = transform.transform_point(&a.center);
+                let (sx, sy) = transform.scale_component();
+                a.radius *= (sx + sy) / 2.0;
+                
+                // 处理旋转
+                let rotation = transform.rotation_angle();
+                a.start_angle += rotation;
+                a.end_angle += rotation;
+            }
+            Geometry::Polyline(pl) => {
+                for v in &mut pl.vertices {
+                    v.point = transform.transform_point(&v.point);
+                }
+            }
+            Geometry::Text(t) => {
+                t.position = transform.transform_point(&t.position);
+                t.rotation += transform.rotation_angle();
+                let (sx, sy) = transform.scale_component();
+                t.height *= (sx + sy) / 2.0;
+            }
+            Geometry::Dimension(d) => {
+                d.definition_point1 = transform.transform_point(&d.definition_point1);
+                d.definition_point2 = transform.transform_point(&d.definition_point2);
+                d.line_location = transform.transform_point(&d.line_location);
+                let (sx, sy) = transform.scale_component();
+                d.text_height *= (sx + sy) / 2.0;
+            }
         }
     }
 
@@ -989,6 +1641,25 @@ impl ZcadApp {
             .pick_file()
         {
             self.pending_file_op = Some(FileOperation::Open(path));
+        }
+    }
+
+    /// 打开文件对话框 - 导出DXF
+    fn show_export_dxf_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("DXF Files", &["dxf"])
+            .set_title("导出 DXF");
+
+        // 如果已有文件名，使用它并修改后缀
+        if let Some(path) = self.document.file_path() {
+            if let Some(file_name) = path.file_stem() {
+                let name = format!("{}.dxf", file_name.to_string_lossy());
+                dialog = dialog.set_file_name(&name);
+            }
+        }
+
+        if let Some(path) = dialog.save_file() {
+            self.pending_file_op = Some(FileOperation::Save(path));
         }
     }
 
@@ -1068,13 +1739,671 @@ impl ZcadApp {
             self.show_save_dialog();
         }
     }
+
+    /// 处理命令
+    fn handle_command(&mut self, command: Command) {
+        match command {
+            Command::SetTool(tool) => {
+                self.ui_state.set_tool(tool);
+            }
+            Command::DeleteSelected => {
+                for id in self.ui_state.selected_entities.clone() {
+                    self.document.remove_entity(&id);
+                }
+                self.ui_state.clear_selection();
+            }
+            Command::Move => {
+                if !self.ui_state.selected_entities.is_empty() {
+                    self.ui_state.edit_state = EditState::MoveOp {
+                        entity_ids: self.ui_state.selected_entities.clone(),
+                        base_point: None,
+                    };
+                    self.ui_state.status_message = "移动: 指定基点:".to_string();
+                } else {
+                    self.ui_state.status_message = "请先选择要移动的对象".to_string();
+                }
+            }
+            Command::Copy => {
+                if !self.ui_state.selected_entities.is_empty() {
+                    self.ui_state.edit_state = EditState::CopyOp {
+                        entity_ids: self.ui_state.selected_entities.clone(),
+                        base_point: None,
+                    };
+                    self.ui_state.status_message = "复制: 指定基点:".to_string();
+                } else {
+                    self.ui_state.status_message = "请先选择要复制的对象".to_string();
+                }
+            }
+            Command::Rotate => {
+                if !self.ui_state.selected_entities.is_empty() {
+                    self.ui_state.edit_state = EditState::RotateOp {
+                        entity_ids: self.ui_state.selected_entities.clone(),
+                        center: None,
+                        start_angle: None,
+                    };
+                    self.ui_state.status_message = "旋转: 指定基点:".to_string();
+                } else {
+                    self.ui_state.status_message = "请先选择要旋转的对象".to_string();
+                }
+            }
+            Command::Scale => {
+                if !self.ui_state.selected_entities.is_empty() {
+                    self.ui_state.edit_state = EditState::ScaleOp {
+                        entity_ids: self.ui_state.selected_entities.clone(),
+                        center: None,
+                        start_dist: None,
+                    };
+                    self.ui_state.status_message = "缩放: 指定基点:".to_string();
+                } else {
+                    self.ui_state.status_message = "请先选择要缩放的对象".to_string();
+                }
+            }
+            Command::Mirror => {
+                if !self.ui_state.selected_entities.is_empty() {
+                    self.ui_state.edit_state = EditState::MirrorOp {
+                        entity_ids: self.ui_state.selected_entities.clone(),
+                        point1: None,
+                    };
+                    self.ui_state.status_message = "镜像: 指定镜像线第一点:".to_string();
+                } else {
+                    self.ui_state.status_message = "请先选择要镜像的对象".to_string();
+                }
+            }
+            Command::ZoomExtents => {
+                self.zoom_to_fit();
+            }
+            Command::New => {
+                self.document = Document::new();
+                self.ui_state.clear_selection();
+                self.ui_state.status_message = "新文档".to_string();
+            }
+            Command::Open => {
+                self.show_open_dialog();
+            }
+            Command::Save => {
+                self.quick_save();
+            }
+            Command::ExportDxf => {
+                self.show_export_dxf_dialog();
+            }
+            Command::Undo => {
+                // 撤销命令处理
+            }
+            Command::Redo => {
+                // 重做命令处理
+            }
+            Command::DataInput(input) => {
+                self.handle_data_input(&input);
+            }
+        }
+    }
+
+    /// 处理数据输入
+    fn handle_data_input(&mut self, input: &str) {
+        // 获取工具和参考点
+        let (tool, reference_point) = if let EditState::Drawing { tool, points, .. } = &self.ui_state.edit_state {
+            (*tool, points.last().copied())
+        } else {
+            return;
+        };
+        
+        // 根据工具类型处理输入
+        match tool {
+            DrawingTool::Line => {
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                self.handle_line_input(input, reference_point, &mut temp_points);
+                
+                if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                }
+            }
+            DrawingTool::Circle => {
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                self.handle_circle_input(input, reference_point, &mut temp_points);
+                
+                if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                }
+            }
+            DrawingTool::Rectangle => {
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                self.handle_rectangle_input(input, reference_point, &mut temp_points);
+                
+                if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                }
+            }
+            DrawingTool::Arc => {
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                self.handle_arc_input(input, reference_point, &mut temp_points);
+                
+                if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                }
+            }
+            DrawingTool::Polyline => {
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                self.handle_polyline_input(input, reference_point, &mut temp_points);
+                
+                if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                }
+            }
+            DrawingTool::Dimension => {
+                // 检查子命令
+                match input.trim().to_uppercase().as_str() {
+                    "R" | "RADIUS" => {
+                        self.ui_state.set_tool(DrawingTool::DimensionRadius);
+                        self.ui_state.status_message = "已切换到半径标注。请选择圆或圆弧:".to_string();
+                        return;
+                    }
+                    "D" | "DIAMETER" => {
+                        self.ui_state.set_tool(DrawingTool::DimensionDiameter);
+                        self.ui_state.status_message = "已切换到直径标注。请选择圆或圆弧:".to_string();
+                        return;
+                    }
+                    _ => {}
+                }
+
+                let mut temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                // 复用直线的输入逻辑（点输入）
+                self.handle_line_input(input, reference_point, &mut temp_points);
+                
+                // 检查是否完成
+                if temp_points.len() == 3 {
+                    let dim = Dimension::new(temp_points[0], temp_points[1], temp_points[2]);
+                    let entity = Entity::new(Geometry::Dimension(dim));
+                    self.document.add_entity(entity);
+                    self.ui_state.edit_state = EditState::Idle;
+                    self.ui_state.status_message = "标注已创建".to_string();
+                } else if let EditState::Drawing { points, .. } = &mut self.ui_state.edit_state {
+                    *points = temp_points;
+                    if points.len() == 1 {
+                        self.ui_state.status_message = "标注: 指定第二个点:".to_string();
+                    } else if points.len() == 2 {
+                        self.ui_state.status_message = "标注: 指定标注线位置:".to_string();
+                    }
+                }
+            }
+            DrawingTool::DimensionRadius => {
+                 let temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                // We expect a point input for text location
+                 match InputParser::parse_point(input, reference_point) {
+                    Ok(point) => {
+                         if temp_points.len() == 2 {
+                             // temp_points[0] is center, temp_points[1] is point on circle
+                             let mut dim = Dimension::new(temp_points[0], temp_points[1], point);
+                             dim.dim_type = zcad_core::geometry::DimensionType::Radius;
+                             let entity = Entity::new(Geometry::Dimension(dim));
+                             self.document.add_entity(entity);
+                             self.ui_state.edit_state = EditState::Idle;
+                             self.ui_state.status_message = "半径标注已创建".to_string();
+                         }
+                    }
+                    Err(e) => {
+                         self.ui_state.status_message = format!("输入错误: {}", e);
+                    }
+                }
+            }
+            DrawingTool::DimensionDiameter => {
+                 let temp_points = if let EditState::Drawing { points, .. } = &self.ui_state.edit_state {
+                    points.clone()
+                } else {
+                    return;
+                };
+                
+                 match InputParser::parse_point(input, reference_point) {
+                    Ok(point) => {
+                         if temp_points.len() == 2 {
+                             // temp_points[0] is center, temp_points[1] is point with radius distance
+                             let center = temp_points[0];
+                             let radius = (temp_points[1] - center).norm();
+                             let text_pos = point;
+                             
+                             let dir = (text_pos - center).normalize();
+                             let p2 = center + dir * radius;
+                             
+                             let mut dim = Dimension::new(center, p2, text_pos);
+                             dim.dim_type = zcad_core::geometry::DimensionType::Diameter;
+                             let entity = Entity::new(Geometry::Dimension(dim));
+                             self.document.add_entity(entity);
+                             self.ui_state.edit_state = EditState::Idle;
+                             self.ui_state.status_message = "直径标注已创建".to_string();
+                         }
+                    }
+                    Err(e) => {
+                         self.ui_state.status_message = format!("输入错误: {}", e);
+                    }
+                }
+            }
+            _ => {
+                self.ui_state.status_message = format!("工具 {} 不支持数据输入", tool.name());
+            }
+        }
+    }
+
+    /// 处理直线工具的输入
+    fn handle_line_input(&mut self, input: &str, reference_point: Option<Point2>, points: &mut Vec<Point2>) {
+        match InputParser::parse(input, reference_point) {
+            Ok(InputValue::Point(point)) => {
+                if points.is_empty() {
+                    // 第一个点
+                    points.push(point);
+                    self.ui_state.status_message = "指定下一点:".to_string();
+                    if let EditState::Drawing { expected_input, .. } = &mut self.ui_state.edit_state {
+                        *expected_input = Some(InputType::Point);
+                    }
+                } else {
+                    // 第二个点，创建直线
+                    let line = Line::new(points[0], point);
+                    let entity = Entity::new(Geometry::Line(line));
+                    self.document.add_entity(entity);
+                    
+                    // 继续绘制，以新点为起点
+                    *points = vec![point];
+                    self.ui_state.status_message = "直线已创建。下一点:".to_string();
+                }
+            }
+            Ok(InputValue::LengthAngle { length, angle }) => {
+                if let Some(ref_point) = reference_point {
+                    let point = Point2::new(
+                        ref_point.x + length * angle.cos(),
+                        ref_point.y + length * angle.sin(),
+                    );
+                    if points.is_empty() {
+                        points.push(point);
+                        self.ui_state.status_message = "指定下一点:".to_string();
+                    } else {
+                        let line = Line::new(points[0], point);
+                        let entity = Entity::new(Geometry::Line(line));
+                        self.document.add_entity(entity);
+                        *points = vec![point];
+                        self.ui_state.status_message = "直线已创建。下一点:".to_string();
+                    }
+                } else {
+                    self.ui_state.status_message = "需要参考点".to_string();
+                }
+            }
+            Ok(InputValue::Length(len)) => {
+                if let Some(ref_point) = reference_point {
+                    // 指向距离输入：沿鼠标方向
+                    let target_pos = self.get_effective_draw_point();
+                    let dir = target_pos - ref_point;
+                    let angle = dir.y.atan2(dir.x);
+                    
+                    let point = Point2::new(
+                        ref_point.x + len * angle.cos(),
+                        ref_point.y + len * angle.sin(),
+                    );
+                    
+                    if points.is_empty() {
+                        points.push(point);
+                        self.ui_state.status_message = "指定下一点:".to_string();
+                    } else {
+                        let line = Line::new(points[0], point);
+                        let entity = Entity::new(Geometry::Line(line));
+                        self.document.add_entity(entity);
+                        *points = vec![point];
+                        self.ui_state.status_message = "直线已创建。下一点:".to_string();
+                    }
+                } else {
+                    self.ui_state.status_message = "需要参考点".to_string();
+                }
+            }
+            Err(e) => {
+                self.ui_state.status_message = format!("输入错误: {}", e);
+            }
+            _ => {
+                self.ui_state.status_message = "无效的输入格式".to_string();
+            }
+        }
+    }
+
+    /// 处理圆工具的输入
+    fn handle_circle_input(&mut self, input: &str, reference_point: Option<Point2>, points: &mut Vec<Point2>) {
+        if points.is_empty() {
+            // 第一个点：圆心
+            match InputParser::parse_point(input, reference_point) {
+                Ok(point) => {
+                    points.push(point);
+                    self.ui_state.status_message = "指定半径:".to_string();
+                    if let EditState::Drawing { expected_input, .. } = &mut self.ui_state.edit_state {
+                        *expected_input = Some(InputType::Radius);
+                    }
+                }
+                Err(e) => {
+                    self.ui_state.status_message = format!("输入错误: {}", e);
+                }
+            }
+        } else {
+            // 第二个输入：半径
+            match InputParser::parse(input, None) {
+                Ok(InputValue::Length(radius)) => {
+                    if radius > 0.0 {
+                        let circle = Circle::new(points[0], radius);
+                        let entity = Entity::new(Geometry::Circle(circle));
+                        self.document.add_entity(entity);
+                        self.ui_state.edit_state = EditState::Idle;
+                        self.ui_state.status_message = "圆已创建".to_string();
+                    } else {
+                        self.ui_state.status_message = "半径必须大于0".to_string();
+                    }
+                }
+                Ok(InputValue::Point(point)) => {
+                    // 也可以输入点来确定半径
+                    let radius = (point - points[0]).norm();
+                    if radius > 0.01 {
+                        let circle = Circle::new(points[0], radius);
+                        let entity = Entity::new(Geometry::Circle(circle));
+                        self.document.add_entity(entity);
+                        self.ui_state.edit_state = EditState::Idle;
+                        self.ui_state.status_message = "圆已创建".to_string();
+                    } else {
+                        self.ui_state.status_message = "半径太小".to_string();
+                    }
+                }
+                Err(e) => {
+                    self.ui_state.status_message = format!("输入错误: {}", e);
+                }
+                _ => {
+                    self.ui_state.status_message = "请输入半径值或点坐标".to_string();
+                }
+            }
+        }
+    }
+
+    /// 处理矩形工具的输入
+    fn handle_rectangle_input(&mut self, input: &str, reference_point: Option<Point2>, points: &mut Vec<Point2>) {
+        if points.is_empty() {
+            // 第一个点：第一个角点
+            match InputParser::parse_point(input, reference_point) {
+                Ok(point) => {
+                    points.push(point);
+                    self.ui_state.status_message = "指定对角点或尺寸:".to_string();
+                    if let EditState::Drawing { expected_input, .. } = &mut self.ui_state.edit_state {
+                        *expected_input = Some(InputType::Point);
+                    }
+                }
+                Err(e) => {
+                    self.ui_state.status_message = format!("输入错误: {}", e);
+                }
+            }
+        } else {
+            // 第二个输入：对角点或尺寸
+            // 优先尝试解析为尺寸 (宽度,高度) - 这样 "100,50" 会被当作尺寸而不是绝对坐标
+            if let Ok((width, height)) = InputParser::parse_dimensions(input) {
+                let p1 = points[0];
+                let p2 = Point2::new(p1.x + width, p1.y + height);
+                let rect = Polyline::from_points(
+                    [
+                        Point2::new(p1.x, p1.y),
+                        Point2::new(p2.x, p1.y),
+                        Point2::new(p2.x, p2.y),
+                        Point2::new(p1.x, p2.y),
+                    ],
+                    true,
+                );
+                let entity = Entity::new(Geometry::Polyline(rect));
+                self.document.add_entity(entity);
+                self.ui_state.edit_state = EditState::Idle;
+                self.ui_state.status_message = "矩形已创建".to_string();
+                return;
+            }
+
+            match InputParser::parse(input, reference_point) {
+                Ok(InputValue::Point(point)) => {
+                    let p1 = points[0];
+                    let p2 = point;
+                    let rect = Polyline::from_points(
+                        [
+                            Point2::new(p1.x, p1.y),
+                            Point2::new(p2.x, p1.y),
+                            Point2::new(p2.x, p2.y),
+                            Point2::new(p1.x, p2.y),
+                        ],
+                        true,
+                    );
+                    let entity = Entity::new(Geometry::Polyline(rect));
+                    self.document.add_entity(entity);
+                    self.ui_state.edit_state = EditState::Idle;
+                    self.ui_state.status_message = "矩形已创建".to_string();
+                }
+                Ok(InputValue::Dimensions { width, height }) => {
+                    let p1 = points[0];
+                    let p2 = Point2::new(p1.x + width, p1.y + height);
+                    let rect = Polyline::from_points(
+                        [
+                            Point2::new(p1.x, p1.y),
+                            Point2::new(p2.x, p1.y),
+                            Point2::new(p2.x, p2.y),
+                            Point2::new(p1.x, p2.y),
+                        ],
+                        true,
+                    );
+                    let entity = Entity::new(Geometry::Polyline(rect));
+                    self.document.add_entity(entity);
+                    self.ui_state.edit_state = EditState::Idle;
+                    self.ui_state.status_message = "矩形已创建".to_string();
+                }
+                Ok(InputValue::Length(len)) => {
+                    // 只有长度：创建正方形
+                    let p1 = points[0];
+                    let p2 = Point2::new(p1.x + len, p1.y + len);
+                    let rect = Polyline::from_points(
+                        [
+                            Point2::new(p1.x, p1.y),
+                            Point2::new(p2.x, p1.y),
+                            Point2::new(p2.x, p2.y),
+                            Point2::new(p1.x, p2.y),
+                        ],
+                        true,
+                    );
+                    let entity = Entity::new(Geometry::Polyline(rect));
+                    self.document.add_entity(entity);
+                    self.ui_state.edit_state = EditState::Idle;
+                    self.ui_state.status_message = "正方形已创建".to_string();
+                }
+                Err(e) => {
+                    self.ui_state.status_message = format!("输入错误: {}", e);
+                }
+                _ => {
+                    self.ui_state.status_message = "请输入对角点坐标或尺寸 (如: 100,50)".to_string();
+                }
+            }
+        }
+    }
+
+    /// 处理圆弧工具的输入
+    fn handle_arc_input(&mut self, input: &str, reference_point: Option<Point2>, points: &mut Vec<Point2>) {
+        match InputParser::parse_point(input, reference_point) {
+            Ok(point) => {
+                points.push(point);
+                
+                if points.len() == 1 {
+                    self.ui_state.status_message = "圆弧: 指定第二点:".to_string();
+                    if let EditState::Drawing { expected_input, .. } = &mut self.ui_state.edit_state {
+                        *expected_input = Some(InputType::Point);
+                    }
+                } else if points.len() == 2 {
+                    self.ui_state.status_message = "圆弧: 指定终点:".to_string();
+                } else if points.len() >= 3 {
+                    // 三个点，创建圆弧
+                    if let Some(arc) = Arc::from_three_points(points[0], points[1], points[2]) {
+                        let entity = Entity::new(Geometry::Arc(arc));
+                        self.document.add_entity(entity);
+                        self.ui_state.edit_state = EditState::Idle;
+                        self.ui_state.status_message = "圆弧已创建".to_string();
+                    } else {
+                        self.ui_state.status_message = "无法创建圆弧（三点共线）".to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                self.ui_state.status_message = format!("输入错误: {}", e);
+            }
+        }
+    }
+
+    /// 处理多段线工具的输入
+    fn handle_polyline_input(&mut self, input: &str, reference_point: Option<Point2>, points: &mut Vec<Point2>) {
+        match InputParser::parse(input, reference_point) {
+            Ok(InputValue::Point(point)) => {
+                // 检查是否接近起点（闭合多段线）
+                if points.len() >= 2 {
+                    let start = points[0];
+                    let tolerance = 0.001;
+                    if (point - start).norm() < tolerance {
+                        // 点击了起点，创建闭合多段线
+                        let polyline = Polyline::from_points(points.clone(), true);
+                        let entity = Entity::new(Geometry::Polyline(polyline));
+                        self.document.add_entity(entity);
+                        self.ui_state.edit_state = EditState::Idle;
+                        self.ui_state.status_message = "闭合多段线已创建".to_string();
+                        return;
+                    }
+                }
+                
+                points.push(point);
+                self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合):".to_string();
+                if let EditState::Drawing { expected_input, .. } = &mut self.ui_state.edit_state {
+                    *expected_input = Some(InputType::Point);
+                }
+            }
+            Ok(InputValue::LengthAngle { length, angle }) => {
+                if let Some(ref_point) = reference_point {
+                    let point = Point2::new(
+                        ref_point.x + length * angle.cos(),
+                        ref_point.y + length * angle.sin(),
+                    );
+                    
+                    // 检查是否接近起点
+                    if points.len() >= 2 {
+                        let start = points[0];
+                        let tolerance = 0.001;
+                        if (point - start).norm() < tolerance {
+                            let polyline = Polyline::from_points(points.clone(), true);
+                            let entity = Entity::new(Geometry::Polyline(polyline));
+                            self.document.add_entity(entity);
+                            self.ui_state.edit_state = EditState::Idle;
+                            self.ui_state.status_message = "闭合多段线已创建".to_string();
+                            return;
+                        }
+                    }
+                    
+                    points.push(point);
+                    self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合):".to_string();
+                } else {
+                    self.ui_state.status_message = "需要参考点".to_string();
+                }
+            }
+            Ok(InputValue::Length(len)) => {
+                if let Some(ref_point) = reference_point {
+                    // 指向距离输入：沿鼠标方向
+                    let target_pos = self.get_effective_draw_point();
+                    let dir = target_pos - ref_point;
+                    let angle = dir.y.atan2(dir.x);
+                    
+                    let point = Point2::new(
+                        ref_point.x + len * angle.cos(),
+                        ref_point.y + len * angle.sin(),
+                    );
+                    
+                    if points.len() >= 2 {
+                        let start = points[0];
+                        let tolerance = 0.001;
+                        if (point - start).norm() < tolerance {
+                            let polyline = Polyline::from_points(points.clone(), true);
+                            let entity = Entity::new(Geometry::Polyline(polyline));
+                            self.document.add_entity(entity);
+                            self.ui_state.edit_state = EditState::Idle;
+                            self.ui_state.status_message = "闭合多段线已创建".to_string();
+                            return;
+                        }
+                    }
+                    
+                    points.push(point);
+                    self.ui_state.status_message = "多段线: 指定下一点 (右键结束, 点击起点闭合):".to_string();
+                } else {
+                    self.ui_state.status_message = "需要参考点".to_string();
+                }
+            }
+            Err(e) => {
+                self.ui_state.status_message = format!("输入错误: {}", e);
+            }
+            _ => {
+                self.ui_state.status_message = "无效的输入格式".to_string();
+            }
+        }
+    }
 }
 
 impl eframe::App for ZcadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 处理文件操作
         self.process_file_operations();
+
+        // 处理待处理的命令（来自UI）
+        if let Some(command) = self.ui_state.pending_command.take() {
+            self.handle_command(command);
+        }
+
+        // 处理命令行输入
+        if let Some(command) = show_command_line(ctx, &mut self.ui_state) {
+            self.handle_command(command);
+        }
         
+        // 自动聚焦命令行：如果在绘图状态且用户开始输入数字/符号
+        let is_text_input = matches!(self.ui_state.edit_state, EditState::TextInput { .. } | EditState::TextEdit { .. });
+        let has_focus = ctx.memory(|m| m.focused().is_some());
+        
+        if !is_text_input && !has_focus {
+            let events = ctx.input(|i| i.events.clone());
+            for event in events {
+                if let egui::Event::Text(text) = event {
+                    // 过滤掉不可打印字符，只接受看起来像命令或数据的输入
+                    if !text.chars().any(|c| c.is_control()) {
+                        self.ui_state.command_input.push_str(&text);
+                        self.ui_state.should_focus_command_line = true;
+                    }
+                }
+            }
+        }
+
         // 更新窗口标题
         let title = if let Some(path) = self.document.file_path() {
             let modified = if self.document.is_modified() { "*" } else { "" };
@@ -1120,6 +2449,10 @@ impl eframe::App for ZcadApp {
                         format!("位置: ({:.2}, {:.2})", t.position.x, t.position.y),
                         format!("高度: {:.3}", t.height),
                     ],
+                    Geometry::Dimension(d) => vec![
+                        format!("测量值: {:.2}", d.measurement()),
+                        format!("文本: {}", d.display_text()),
+                    ],
                     #[allow(unreachable_patterns)]
                     _ => vec![],
                 };
@@ -1154,6 +2487,10 @@ impl eframe::App for ZcadApp {
                     }
                     if ui.button("💾 另存为 (Ctrl+Shift+S)").clicked() {
                         self.show_save_dialog();
+                        ui.close();
+                    }
+                    if ui.button("📤 导出 DXF...").clicked() {
+                        self.show_export_dxf_dialog();
                         ui.close();
                     }
                     ui.separator();
@@ -1201,6 +2538,18 @@ impl eframe::App for ZcadApp {
                         self.ui_state.set_tool(DrawingTool::Text);
                         ui.close();
                     }
+                    if ui.button("📏 标注 (D)").clicked() {
+                        self.ui_state.set_tool(DrawingTool::Dimension);
+                        ui.close();
+                    }
+                    if ui.button("○← 半径标注").clicked() {
+                        self.ui_state.set_tool(DrawingTool::DimensionRadius);
+                        ui.close();
+                    }
+                    if ui.button("Ø 直径标注").clicked() {
+                        self.ui_state.set_tool(DrawingTool::DimensionDiameter);
+                        ui.close();
+                    }
                 });
             });
         });
@@ -1229,6 +2578,15 @@ impl eframe::App for ZcadApp {
                 }
                 if ui.selectable_label(current_tool == DrawingTool::Text, "A 文本").clicked() {
                     self.ui_state.set_tool(DrawingTool::Text);
+                }
+                if ui.selectable_label(current_tool == DrawingTool::Dimension, "📏 标注").clicked() {
+                    self.ui_state.set_tool(DrawingTool::Dimension);
+                }
+                if ui.selectable_label(current_tool == DrawingTool::DimensionRadius, "○← 半径").clicked() {
+                    self.ui_state.set_tool(DrawingTool::DimensionRadius);
+                }
+                if ui.selectable_label(current_tool == DrawingTool::DimensionDiameter, "Ø 直径").clicked() {
+                    self.ui_state.set_tool(DrawingTool::DimensionDiameter);
                 }
                 ui.separator();
                 if ui.button("🗑").on_hover_text("删除选中").clicked() {
@@ -1308,6 +2666,69 @@ impl eframe::App for ZcadApp {
                 ui.label(format!("类型: {}", type_name));
                 ui.separator();
                 for p in props { ui.label(p); }
+                
+                // 特殊属性编辑
+                if selected_count == 1 {
+                    let id = self.ui_state.selected_entities[0];
+                    // 先克隆需要的属性，避免持有 document 的引用
+                    let (dim_text_height, dim_text_pos) = if let Some(entity) = self.document.get_entity(&id) {
+                        if let Geometry::Dimension(d) = &entity.geometry {
+                            (Some(d.text_height), Some(d.get_text_position()))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                    if let (Some(mut height), Some(mut pos)) = (dim_text_height, dim_text_pos) {
+                        ui.separator();
+                        ui.label("字体大小:");
+                        if ui.add(egui::DragValue::new(&mut height).speed(0.1).range(0.1..=1000.0)).changed() {
+                            if let Some(mut new_entity) = self.document.get_entity(&id).cloned() {
+                                if let Geometry::Dimension(dim) = &mut new_entity.geometry {
+                                    dim.text_height = height;
+                                }
+                                self.document.update_entity(&id, new_entity);
+                            }
+                        }
+                        
+                        // 调节文本位置 (X, Y)
+                        ui.separator();
+                        ui.label("文本位置:");
+                        let mut changed = false;
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("X:");
+                            if ui.add(egui::DragValue::new(&mut pos.x).speed(1.0)).changed() {
+                                changed = true;
+                            }
+                            ui.label("Y:");
+                            if ui.add(egui::DragValue::new(&mut pos.y).speed(1.0)).changed() {
+                                changed = true;
+                            }
+                        });
+                        
+                        if changed {
+                            if let Some(mut new_entity) = self.document.get_entity(&id).cloned() {
+                                if let Geometry::Dimension(dim) = &mut new_entity.geometry {
+                                    dim.text_position = Some(pos);
+                                }
+                                self.document.update_entity(&id, new_entity);
+                            }
+                        }
+                        
+                        // 重置文本位置
+                        if ui.button("重置文本位置").clicked() {
+                            if let Some(mut new_entity) = self.document.get_entity(&id).cloned() {
+                                if let Geometry::Dimension(dim) = &mut new_entity.geometry {
+                                    dim.text_position = None;
+                                }
+                                self.document.update_entity(&id, new_entity);
+                            }
+                        }
+                    }
+                }
             } else if selected_count > 1 {
                 ui.label(format!("{} 个对象", selected_count));
             } else {
@@ -1518,6 +2939,33 @@ impl eframe::App for ZcadApp {
                     self.handle_right_click();
                 }
 
+                // 处理空格键（重复上一次命令）
+                if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !is_text_input {
+                    // 如果正在输入命令，不要处理空格（egui text_edit 会处理）
+                    // 但这里 text_edit 是在 update 调用的 show_command_line 里面处理的
+                    // 如果焦点在命令行，空格会被输入到命令行，这里不应该拦截
+                    if !self.ui_state.should_focus_command_line && self.ui_state.command_input.is_empty() {
+                         // 如果当前空闲，则尝试重复上一次命令
+                         if matches!(self.ui_state.edit_state, EditState::Idle) {
+                             if let Some(cmd) = self.ui_state.last_command.clone() {
+                                 self.ui_state.status_message = format!("重复命令: {:?}", cmd);
+                                 self.handle_command(cmd);
+                             }
+                         } else {
+                             // 如果正在操作中，空格通常作为确认（如多段线结束）或下一步
+                             // 这里简单起见，如果是在绘图状态，视为空格确认（类似于回车）
+                             // 但目前回车是在命令行处理的。
+                             // 如果我们想让空格在绘图时等同于回车确认输入：
+                             // 这需要更复杂的逻辑，因为空格可能也是坐标分隔符。
+                             // 目前 CAD 的习惯是：空命令行的回车/空格 = 重复上一次命令。
+                             // 正在输入时，空格是分隔符。
+                             // 结束选择时，空格是确认。
+                             
+                             // 简单实现：仅在 Idle 状态下响应空格重复命令
+                         }
+                    }
+                }
+
                 // 处理键盘快捷键（仅在非文本输入状态下）
                 let is_text_input = matches!(self.ui_state.edit_state, EditState::TextInput { .. } | EditState::TextEdit { .. });
                 if !is_text_input {
@@ -1609,6 +3057,10 @@ impl eframe::App for ZcadApp {
                         // 文本快捷键
                         if i.key_pressed(egui::Key::T) {
                             self.ui_state.set_tool(DrawingTool::Text);
+                        }
+                        // 标注快捷键
+                        if i.key_pressed(egui::Key::D) {
+                            self.ui_state.set_tool(DrawingTool::Dimension);
                         }
                     });
                 }

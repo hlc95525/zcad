@@ -579,6 +579,7 @@ impl ComputeShader {
                     param2: 0.0,
                 }
             ],
+            Geometry::Dimension(_) => vec![], // 暂不支持GPU计算标注
         }
     }
 

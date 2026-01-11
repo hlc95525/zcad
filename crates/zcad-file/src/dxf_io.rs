@@ -98,6 +98,89 @@ fn convert_dxf_entity(entity: &dxf::entities::Entity) -> Option<Entity> {
             Geometry::Text(zcad_text)
         }
 
+        dxf::entities::EntityType::ModelPoint(point) => {
+            let position = Point2::new(point.location.x, point.location.y);
+            Geometry::Point(zcad_core::geometry::Point::from_point2(position))
+        }
+
+        dxf::entities::EntityType::RotatedDimension(dim) => {
+            // RotatedDimension (AcDbRotatedDimension/AcDbAlignedDimension)
+            // definition_point_2 (13) = Extension line 1 origin (Start point)
+            // definition_point_3 (14) = Extension line 2 origin (End point)
+            // definition_point_1 (10 in base) = Dimension line definition point
+            
+            let p1 = Point2::new(dim.definition_point_2.x, dim.definition_point_2.y);
+            let p2 = Point2::new(dim.definition_point_3.x, dim.definition_point_3.y);
+            let location = Point2::new(dim.dimension_base.definition_point_1.x, dim.dimension_base.definition_point_1.y);
+            
+            let mut zcad_dim = zcad_core::geometry::Dimension::new(p1, p2, location);
+            
+            match dim.dimension_base.dimension_type {
+                dxf::enums::DimensionType::Aligned => {
+                    zcad_dim.dim_type = zcad_core::geometry::DimensionType::Aligned;
+                }
+                _ => {
+                    // Default to Linear for RotatedHorizontalOrVertical or others
+                    zcad_dim.dim_type = zcad_core::geometry::DimensionType::Linear;
+                }
+            }
+            
+            if !dim.dimension_base.text.is_empty() && dim.dimension_base.text != "<>" {
+                zcad_dim.text_override = Some(dim.dimension_base.text.clone());
+            }
+            
+            // 读取文本位置 (11)
+            let text_pos = Point2::new(dim.dimension_base.text_mid_point.x, dim.dimension_base.text_mid_point.y);
+            // 检查是否是有效位置 (0,0可能是未设置)
+            if text_pos.x.abs() > 1e-6 || text_pos.y.abs() > 1e-6 {
+                zcad_dim.text_position = Some(text_pos);
+            }
+            
+            Geometry::Dimension(zcad_dim)
+        }
+
+        dxf::entities::EntityType::RadialDimension(dim) => {
+            // 10: Center (definition_point_1 in base)
+            // 15: Point on curve (definition_point_2)
+            let center = Point2::new(dim.dimension_base.definition_point_1.x, dim.dimension_base.definition_point_1.y);
+            let point_on_curve = Point2::new(dim.definition_point_2.x, dim.definition_point_2.y);
+            let text_pos = Point2::new(dim.dimension_base.text_mid_point.x, dim.dimension_base.text_mid_point.y);
+
+            let mut zcad_dim = zcad_core::geometry::Dimension::new(center, point_on_curve, text_pos);
+            zcad_dim.dim_type = zcad_core::geometry::DimensionType::Radius;
+
+            if !dim.dimension_base.text.is_empty() && dim.dimension_base.text != "<>" {
+                zcad_dim.text_override = Some(dim.dimension_base.text.clone());
+            }
+            
+            // 半径/直径标注的 text_pos 总是有效的
+            zcad_dim.text_position = Some(text_pos);
+
+            Geometry::Dimension(zcad_dim)
+        }
+
+        dxf::entities::EntityType::DiameterDimension(dim) => {
+            // 15: Point on curve (definition_point_2)
+            // 10: Opposite point on curve (definition_point_1 in base)
+            let p1 = Point2::new(dim.definition_point_2.x, dim.definition_point_2.y);
+            let p2 = Point2::new(dim.dimension_base.definition_point_1.x, dim.dimension_base.definition_point_1.y);
+            
+            // Calculate center as midpoint
+            let center = p1 + (p2 - p1) * 0.5;
+            let text_pos = Point2::new(dim.dimension_base.text_mid_point.x, dim.dimension_base.text_mid_point.y);
+
+            let mut zcad_dim = zcad_core::geometry::Dimension::new(center, p1, text_pos);
+            zcad_dim.dim_type = zcad_core::geometry::DimensionType::Diameter;
+
+            if !dim.dimension_base.text.is_empty() && dim.dimension_base.text != "<>" {
+                zcad_dim.text_override = Some(dim.dimension_base.text.clone());
+            }
+            
+            zcad_dim.text_position = Some(text_pos);
+
+            Geometry::Dimension(zcad_dim)
+        }
+
         // TODO: 支持更多实体类型
         _ => return None,
     };
@@ -197,6 +280,80 @@ fn convert_to_dxf_entity(entity: &Entity) -> Option<dxf::entities::Entity> {
             dxf_text.value = text.content.clone();
             dxf_text.rotation = text.rotation.to_degrees();
             dxf::entities::EntityType::Text(dxf_text)
+        }
+        Geometry::Dimension(dim) => {
+            let mut base = dxf::entities::DimensionBase::default();
+            
+            // 设置文本位置 (11)
+            // base.text_mid_point = dxf::Point::new(dim.line_location.x, dim.line_location.y, 0.0);
+            
+            // 设置文本内容
+            if let Some(text) = &dim.text_override {
+                base.text = text.clone();
+            } else {
+                // 空字符串表示使用测量值
+                base.text = String::new();
+            }
+
+            // 设置文本位置 (11) - 如果有自定义位置，使用它；否则使用默认计算位置
+            let text_pos = dim.get_text_position();
+            base.text_mid_point = dxf::Point::new(text_pos.x, text_pos.y, 0.0);
+            
+            match dim.dim_type {
+                zcad_core::geometry::DimensionType::Radius => {
+                    base.dimension_type = dxf::enums::DimensionType::Radius;
+                    
+                    // 10: Center (p1)
+                    base.definition_point_1 = dxf::Point::new(dim.definition_point1.x, dim.definition_point1.y, 0.0);
+                    
+                    let mut dxf_dim = dxf::entities::RadialDimension::default();
+                    dxf_dim.dimension_base = base;
+                    
+                    // 15: Point on curve (p2)
+                    dxf_dim.definition_point_2 = dxf::Point::new(dim.definition_point2.x, dim.definition_point2.y, 0.0);
+                    
+                    dxf::entities::EntityType::RadialDimension(dxf_dim)
+                },
+                zcad_core::geometry::DimensionType::Diameter => {
+                    base.dimension_type = dxf::enums::DimensionType::Diameter;
+                    
+                    // 10: Opposite point
+                    let opposite = dim.definition_point1 + (dim.definition_point1 - dim.definition_point2);
+                    base.definition_point_1 = dxf::Point::new(opposite.x, opposite.y, 0.0);
+                    
+                    let mut dxf_dim = dxf::entities::DiameterDimension::default();
+                    dxf_dim.dimension_base = base;
+                    
+                    // 15: Point on curve (p2)
+                    dxf_dim.definition_point_2 = dxf::Point::new(dim.definition_point2.x, dim.definition_point2.y, 0.0);
+                    
+                    dxf::entities::EntityType::DiameterDimension(dxf_dim)
+                },
+                _ => {
+                    // definition_point_1 (10) = Dimension line definition point
+                    base.definition_point_1 = dxf::Point::new(dim.line_location.x, dim.line_location.y, 0.0);
+                    
+                    let mut dxf_dim = dxf::entities::RotatedDimension::default();
+                    
+                    if dim.dim_type == zcad_core::geometry::DimensionType::Aligned {
+                         base.dimension_type = dxf::enums::DimensionType::Aligned;
+                    } else {
+                         base.dimension_type = dxf::enums::DimensionType::RotatedHorizontalOrVertical;
+                    }
+
+                    dxf_dim.dimension_base = base;
+                    
+                    // definition_point_2 (13) = Extension line 1 origin (Start point)
+                    dxf_dim.definition_point_2 = dxf::Point::new(dim.definition_point1.x, dim.definition_point1.y, 0.0);
+                    // definition_point_3 (14) = Extension line 2 origin (End point)
+                    dxf_dim.definition_point_3 = dxf::Point::new(dim.definition_point2.x, dim.definition_point2.y, 0.0);
+                    
+                    // insertion_point (12)
+                    dxf_dim.insertion_point = dxf::Point::new(dim.line_location.x, dim.line_location.y, 0.0);
+                    
+                    dxf::entities::EntityType::RotatedDimension(dxf_dim)
+                }
+            }
         }
     };
 

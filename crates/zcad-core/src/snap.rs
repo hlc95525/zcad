@@ -321,6 +321,22 @@ impl SnapEngine {
                     }
                 }
             }
+            Geometry::Dimension(dim) => {
+                // 标注捕捉定义点
+                if self.config.enabled_types.is_enabled(SnapType::Endpoint) {
+                    for &pt in &[dim.definition_point1, dim.definition_point2] {
+                        let dist = (pt - mouse).norm();
+                        if dist <= tolerance {
+                            self.candidates.push(SnapPoint::new(
+                                pt,
+                                SnapType::Endpoint,
+                                Some(entity.id),
+                                dist,
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 

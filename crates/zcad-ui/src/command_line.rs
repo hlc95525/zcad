@@ -1,6 +1,6 @@
 //! 命令行界面
 
-use crate::state::{Command, UiState};
+use crate::state::{Command, EditState, UiState};
 
 /// 渲染命令行
 pub fn show_command_line(ctx: &egui::Context, ui_state: &mut UiState) -> Option<Command> {
@@ -16,13 +16,30 @@ pub fn show_command_line(ctx: &egui::Context, ui_state: &mut UiState) -> Option<
                 ui.separator();
 
                 // 命令输入
+                // 根据当前状态显示不同的提示
+                let hint_text = if let EditState::Drawing { expected_input, .. } = &ui_state.edit_state {
+                    if let Some(input_type) = expected_input {
+                        input_type.hint()
+                    } else {
+                        "Enter command or data..."
+                    }
+                } else {
+                    "Enter command..."
+                };
+
                 ui.label("Command:");
 
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut ui_state.command_input)
                         .desired_width(300.0)
-                        .hint_text("Enter command..."),
+                        .hint_text(hint_text),
                 );
+
+                // 自动聚焦
+                if ui_state.should_focus_command_line {
+                    response.request_focus();
+                    ui_state.should_focus_command_line = false;
+                }
 
                 // 回车执行命令
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {

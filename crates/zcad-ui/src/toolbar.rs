@@ -1,6 +1,6 @@
 //! 工具栏
 
-use crate::state::{DrawingTool, UiState};
+use crate::state::{Command, DrawingTool, UiState};
 
 /// 渲染工具栏
 pub fn show_toolbar(ctx: &egui::Context, ui_state: &mut UiState) {
@@ -10,13 +10,13 @@ pub fn show_toolbar(ctx: &egui::Context, ui_state: &mut UiState) {
 
             // 文件操作
             if ui.button("📄 New").clicked() {
-                // TODO: 新建文件
+                ui_state.pending_command = Some(Command::New);
             }
             if ui.button("📂 Open").clicked() {
-                // TODO: 打开文件
+                ui_state.pending_command = Some(Command::Open);
             }
             if ui.button("💾 Save").clicked() {
-                // TODO: 保存文件
+                ui_state.pending_command = Some(Command::Save);
             }
 
             ui.separator();
@@ -35,16 +35,19 @@ pub fn show_toolbar(ctx: &egui::Context, ui_state: &mut UiState) {
 
             // 修改工具
             if ui.button("↔ Move").clicked() {
-                // TODO
+                ui_state.pending_command = Some(Command::Move);
             }
             if ui.button("⎘ Copy").clicked() {
-                // TODO
+                ui_state.pending_command = Some(Command::Copy);
             }
             if ui.button("↻ Rotate").clicked() {
-                // TODO
+                ui_state.pending_command = Some(Command::Rotate);
             }
             if ui.button("⤢ Scale").clicked() {
-                // TODO
+                ui_state.pending_command = Some(Command::Scale);
+            }
+            if ui.button("◂▸ Mirror").clicked() {
+                ui_state.pending_command = Some(Command::Mirror);
             }
 
             ui.separator();

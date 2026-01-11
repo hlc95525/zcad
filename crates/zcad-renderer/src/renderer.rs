@@ -287,6 +287,7 @@ impl Renderer {
                 // 实际的文本渲染由 egui 处理
                 self.draw_text_marker(text, color_arr);
             }
+            Geometry::Dimension(_) => {}
         }
     }
 
@@ -688,6 +689,7 @@ impl Renderer {
                 vertices.push(LineVertex::new(x, y - size, color_arr));
                 vertices.push(LineVertex::new(x, y + size, color_arr));
             }
+            Geometry::Dimension(_) => {}
         }
     }
 }
